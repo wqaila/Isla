@@ -1,0 +1,29 @@
+// 复制本文件为 config.h,再填你自己的值(不要把真实密码 push 到 Git)
+//   cp config.h.example config.h
+// 服务地址就是本机在局域网里的 IP,本机访问也可填 127.0.0.1。
+
+#ifndef CONFIG_H
+#define CONFIG_H
+
+// WiFi
+#define WIFI_SSID       "your_wifi_ssid"
+#define WIFI_PASS       "your_wifi_password"
+
+// 本机服务器(运行 server/app.py 的那台电脑)
+#define SERVER_HOST     "192.168.1.100"
+#define SERVER_PORT     8000
+
+// 分组与设备标识(任务卡"提交与迁移"需要)
+#define GROUP_ID        "G03"
+#define DEVICE_ID       "esp32-imu-01"
+
+// ============================================================
+//   真实传感源 vs 演示模式  (核心开关,对照周任务卡"真实传感数据")
+// ============================================================
+// USE_MPU6050 = 1  : 接了 MPU6050(GY-521),读真实 IMU,上传 status="ok"
+// USE_MPU6050 = 0  : 板子在手但还没接传感器,用合成 sin 波形生成数据
+//                    status="simulated",仍能验证 WiFi/HTTP/链路
+// 三阶段路径:现在没板 → (拿到板) 设 0 演示 → (接传感器后) 改 1 真实
+#define USE_MPU6050     1
+
+#endif

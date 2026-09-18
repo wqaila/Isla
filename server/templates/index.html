@@ -1,0 +1,184 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <title>IMU 传感数据展示</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}" />
+</head>
+<body>
+  <header>
+    <h1>开发板 IMU 传感数据 · 实时展示</h1>
+    <div class="meta">
+      <label>Group ID:
+        <input id="groupInput" type="text" value="G03" maxlength="16" />
+      </label>
+      <span class="dot" id="statusDot"></span>
+      <span id="statusText">连接中…</span>
+      <button id="refreshBtn" type="button">手动刷新</button>
+    </div>
+  </header>
+
+  <main>
+    <section class="card">
+      <h2>来源信息</h2>
+      <table class="kv">
+        <tr><th>分组</th><td id="groupId">—</td></tr>
+        <tr><th>设备</th><td id="deviceId">—</td></tr>
+        <tr><th>板端时间戳 (ms)</th><td id="tsMs">—</td></tr>
+        <tr><th>本机接收时间</th><td id="recvMs">—</td></tr>
+        <tr><th>距上次更新</th><td id="sinceUpdate">—</td></tr>
+        <tr><th>状态</th><td id="status">—</td></tr>
+        <tr><th>累计记录数</th><td id="totalCount">—</td></tr>
+      </table>
+    </section>
+
+    <section class="card">
+      <h2>当前传感读数(动态字段,不写死)</h2>
+      <table class="kv" id="fieldsTable">
+        <tbody><tr><td class="muted">暂无数据,请先启动板端或模拟器。</td></tr></tbody>
+      </table>
+    </section>
+
+    <section class="card">
+      <h2>最近 30 个采样(acc_z,g)</h2>
+      <svg id="chart" viewBox="0 0 600 160" preserveAspectRatio="none">
+        <line x1="0" y1="80" x2="600" y2="80" stroke="#bbb" stroke-dasharray="4 4" />
+        <polyline id="chartLine" fill="none" stroke="#2563eb" stroke-width="2"
+                  points="" />
+      </svg>
+      <div class="hint">横轴:时间(最新在右),纵轴:acc_z(m/s²),水平虚线为 0</div>
+    </section>
+
+    <section class="card">
+      <h2>原始数据(data.json 节选)</h2>
+      <pre id="rawPreview">…</pre>
+    </section>
+  </main>
+
+  <footer>
+    <small>第 1 周任务 · 本机 Flask 服务 · 自动每 1s 拉取 /api/latest 与 /api/history</small>
+  </footer>
+
+<script>
+  // -------- 工具 --------
+  const $ = (id) => document.getElementById(id);
+  const fmtNum = (v) => {
+    if (typeof v !== "number") return String(v);
+    if (Math.abs(v) >= 100) return v.toFixed(1);
+    if (Math.abs(v) >= 1) return v.toFixed(3);
+    return v.toFixed(5);
+  };
+  const nowMs = () => Date.now();
+
+  // -------- 状态机:无数据 / 已超时 / 失败 / 正常 --------
+  function setStatus(state, text) {
+    const dot = $("statusDot");
+    dot.className = "dot " + state;
+    $("statusText").textContent = text;
+  }
+
+  // -------- 拉取最新一条 --------
+  async function fetchLatest() {
+    const g = $("groupInput").value.trim() || "G03";
+    const r = await fetch(`/api/latest?group_id=${encodeURIComponent(g)}&_=${nowMs()}`);
+    const j = await r.json();
+    if (!j.ok) { setStatus("fail", "服务错误"); return; }
+    if (!j.record) {
+      $("groupId").textContent = g;
+      $("deviceId").textContent = "—";
+      $("tsMs").textContent = "—";
+      $("recvMs").textContent = "—";
+      $("sinceUpdate").textContent = "—";
+      $("status").innerHTML = '<span class="badge warn">无数据</span>';
+      $("fieldsTable").innerHTML = '<tbody><tr><td class="muted">本分组尚无数据,请先运行板端或模拟器。</td></tr></tbody>';
+      $("rawPreview").textContent = "(空)";
+      setStatus("idle", "无数据");
+      return;
+    }
+    const rec = j.record;
+    $("groupId").textContent = rec.group_id;
+    $("deviceId").textContent = rec.device_id;
+    $("tsMs").textContent = rec.ts_ms ?? "—";
+    $("recvMs").textContent = new Date(rec.received_at_ms).toLocaleString();
+
+    const since = Math.max(0, Math.floor((nowMs() - rec.received_at_ms) / 1000));
+    $("sinceUpdate").textContent = since + " 秒";
+
+    if (rec.status === "ok") {
+      $("status").innerHTML = '<span class="badge ok">ok</span>';
+    } else if (rec.status === "simulated") {
+      $("status").innerHTML = '<span class="badge demo">simulated</span>';
+    } else {
+      $("status").innerHTML = '<span class="badge fail">' + rec.status + '</span>';
+    }
+
+    // 动态字段表
+    const data = rec.data || {};
+    const tbody = document.createElement("tbody");
+    const keys = Object.keys(data);
+    if (keys.length === 0) {
+      tbody.innerHTML = '<tr><td class="muted">数据体为空</td></tr>';
+    } else {
+      for (const k of keys) {
+        const tr = document.createElement("tr");
+        tr.innerHTML = `<th>${k}</th><td>${fmtNum(data[k])}</td>`;
+        tbody.appendChild(tr);
+      }
+    }
+    $("fieldsTable").innerHTML = "";
+    $("fieldsTable").appendChild(tbody);
+
+    $("rawPreview").textContent = JSON.stringify(rec, null, 2);
+
+    // 状态总览
+    if (since > 10) {
+      setStatus("stale", "已超时 " + since + " 秒(停采或网络异常)");
+    } else if (rec.status === "simulated") {
+      setStatus("live", "正常(板端演示数据) · " + since + "s 前更新");
+    } else if (rec.status !== "ok") {
+      setStatus("fail", "传感器/数据状态异常:" + rec.status);
+    } else {
+      setStatus("live", "正常 · " + since + "s 前更新");
+    }
+  }
+
+  // -------- 拉取最近 N 条画图 --------
+  async function fetchHistory() {
+    const g = $("groupInput").value.trim() || "G03";
+    const r = await fetch(`/api/history?group_id=${encodeURIComponent(g)}&limit=30&_=${nowMs()}`);
+    const j = await r.json();
+    if (!j.ok || !j.records) return;
+    const series = j.records
+      .map(rec => Number(rec.data && rec.data.acc_z))
+      .filter(v => Number.isFinite(v));
+    $("totalCount").textContent = series.length;
+    if (series.length < 2) return;
+    const min = Math.min(...series), max = Math.max(...series);
+    const span = (max - min) || 1;
+    const W = 600, H = 160, pad = 12;
+    const stepX = (W - pad*2) / (series.length - 1);
+    const pts = series.map((v, i) => {
+      const x = pad + i * stepX;
+      const y = pad + (H - pad*2) * (1 - (v - min) / span);
+      return `${x.toFixed(1)},${y.toFixed(1)}`;
+    });
+    $("chartLine").setAttribute("points", pts.join(" "));
+  }
+
+  // -------- 主循环 --------
+  async function tick() {
+    try {
+      await Promise.all([fetchLatest(), fetchHistory()]);
+    } catch (e) {
+      setStatus("fail", "请求失败:" + e.message);
+    }
+  }
+  $("refreshBtn").addEventListener("click", tick);
+  $("groupInput").addEventListener("change", tick);
+  setStatus("idle", "等待数据…");
+  tick();
+  setInterval(tick, 1000);
+</script>
+</body>
+</html>

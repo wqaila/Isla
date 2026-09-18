@@ -1,0 +1,46 @@
+# ====================================================================
+#  第 1 周任务 · 开发板 IMU 采集 + Web 展示系统
+# ====================================================================
+
+# ----- Python -----
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+server/.venv/
+server/.venv/
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+
+# ----- 运行时生成的原始数据(任务卡要求手开核对,仓库里就别污染 git) -----
+server/data.json
+logs/
+*.log
+
+# ----- 板端(含 WiFi 密码) -----
+board/config.h
+board/*/config.h
+*.ini
+*.env
+
+# ----- Arduino / PlatformIO 编译产物 -----
+board/build/
+board/.pio/
+board/.vscode/
+
+# ----- IDE -----
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# ----- Misc -----
+*.bak
+*~
+
+# ----- AI 助手工作记忆(本地数据,不进仓库) -----
+.workbuddy-ai/
