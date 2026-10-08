@@ -57,20 +57,27 @@
 - **Python 3.10+**(Windows 自带或商店安装),运行 `python --version` 验证。
 - 浏览器(Chrome/Edge 即可)
 
-### 1.2 硬件(等老师发放或自备)
-- ESP32-DevKitC(任何 ESP32 都行)
-- MPU6050 模块(GY-521),I2C 接口
-- 杜邦线 4 根
+### 1.2 硬件
 
-### 1.3 接线(MPU6050 → ESP32)
-| MPU6050 | ESP32 |
-|---------|-------|
-| VCC     | 3.3V  |
-| GND     | GND   |
-| SDA     | GPIO21(默认 I2C SDA) |
-| SCL     | GPIO22(默认 I2C SCL) |
+**本项目硬件:ESP32-S3-EYE**(乐鑫官方 AI 开发板)
 
-> AD0 留空(地址 0x68);若接 3.3V 则地址 0x69,代码里改 `MPU_ADDR`。
+| 项目 | 规格 |
+|------|------|
+| 主控 | ESP32-S3-WROOM-1(8MB Octal PSRAM + 8MB Flash) |
+| 加速度计 | **QMA7981 三轴**(板载,I²C 地址 0x12) |
+| 摄像头 | OV2640(板载,本任务不用) |
+| 麦克风 | MEMS 数字麦(板载,本任务不用) |
+| 接口 | Micro-USB ×1(**芯片原生 USB Serial/JTAG,无 UART 桥接芯片**) |
+
+> 传感器焊在板上,**无需任何杜邦线接线**。
+
+### 1.3 接线
+
+**不需要接线** —— QMA7981 是板载传感器,I²C 走板内连线(SDA=GPIO4,SCL=GPIO5)。
+
+只需一根 **Micro-USB 数据线**连接电脑(注意:**要能传数据的线**,不是纯充电线)。
+
+> ⚠️ 优先插 **USB 2.0 口**(黑色内芯)。USB 3.0 口与 S3 原生 USB 有兼容性问题,会导致上传 `Write timeout`。
 
 ---
 
@@ -122,7 +129,10 @@ python send_sim.py --server http://127.0.0.1:8000 --group G03 --device sim-pc-01
 
 ---
 
-## 4. 板端(拿到 ESP32 + MPU6050 后)
+## 4. 板端(ESP32-S3-EYE)
+
+> **本项目当前硬件:ESP32-S3-EYE**(乐鑫 AI 开发板,板载 QMA7981 三轴加速度计 + OV2640 摄像头 + 数字麦克风)
+> 传感器**焊在板子上,无需任何接线**。
 
 ### 4.0 找本机 IP(填进 config.h)
 
@@ -138,67 +148,84 @@ python scripts\find_local_ip.py
     #define SERVER_PORT  8000
 ```
 
-### 4.1 接线(ESP32 ← IMU 模块)
+### 4.1 板载硬件(无需接线)
 
-先物理接上,才能识别型号。绝大多数 I²C 的 6 轴模块引脚定义相同:
+| 项目 | 值 |
+|------|-----|
+| 加速度计 | **QMA7981** 三轴,I²C 地址 `0x12` |
+| I²C 引脚 | **SDA = GPIO4,SCL = GPIO5**(板载连线) |
+| 摄像头 | OV2640,I²C 地址 `0x30`(本任务不用) |
+| USB | 1 个 Micro-USB,**芯片原生 USB Serial/JTAG**,无 UART 桥接芯片 |
 
-| 传感器模块引脚 | ESP32 引脚 | 说明 |
-|--------------|------------|------|
-| VCC          | 3.3V       | **不要接 5V**,多数 IMU 是 3.3V 供电 |
-| GND          | GND        | 必须共地 |
-| SDA          | GPIO21     | 默认 I²C SDA |
-| SCL          | GPIO22     | 默认 I²C SCL |
-| AD0 / SA0    | 悬空       | 决定地址 0x68 / 0x69;悬空通常是 0x68 |
+> ⚠️ **S3-EYE 的 I²C 没有外部上拉电阻**,代码里必须 `pinMode(INPUT_PULLUP)`,否则传感器完全读不到。`imu_http.ino` 已处理。
 
-> 模块上有的标 `SCL/SDA`,有的标 `SCK/SDI`,含义相同。**接线前先断电**。
+### 4.2 识别传感器型号(可选,排查用)
 
-### 4.2 识别传感器型号(型号不确定时必做)
+`board/i2c_scan/i2c_scan.ino` —— 扫描 I²C 总线并识别型号。
 
-用 Arduino IDE 打开 **`board/i2c_scan/i2c_scan.ino`** → 选 `ESP32 Dev Module` → 上传 → 打开串口监视器(115200)。
-
-它每 3 秒扫一次 I²C 总线,打印地址和型号线索:
+正常输出:
 ```
 --- scan ---
-  地址 0x68   WHO_AM_I(0x75)=0x68   -> MPU6050
+  地址 0x12   寄存器0x00=0x90   -> QMA7981 加速度计
+  共发现 1 个设备。
 ```
-- 出现 `-> MPU6050`:型号标准,后续直接用项目默认代码。
-- 出现别的型号(如 `ICM-20602`、`BMI160`):把结果告诉我,我帮你改驱动寄存器。
-- **什么都没扫到**:查 VCC 是否 3.3V、SDA/SCL 是否接反、杜邦线是否插紧。
+- `0x12` 有响应 = 传感器正常
+- **`寄存器0x00` 的值随批次变化**(实测 0x90,参考文档是 0xE7),不强制校验
 
-### 4.3 配置 & 模式开关
+### 4.3 配置
 
-1. `board/imu_http/config.h` 已自动生成,**只需改两处 WiFi**:
-   ```cpp
-   #define WIFI_SSID       "改成你的WiFi名"      // ← 必改(ESP32 仅支持 2.4GHz)
-   #define WIFI_PASS       "改成你的WiFi密码"    // ← 必改
-   #define SERVER_HOST     "10.1.41.110"        // 已自动填好你的电脑 IP
-   #define SERVER_PORT     8000
-   #define GROUP_ID        "G03"
-   #define DEVICE_ID       "esp32-imu-01"
-   #define USE_MPU6050     1                    // 1=读真实传感器
-   ```
-2. **`USE_MPU6050` 决定数据来源**(对应三阶段路径 B/C):
-   ```cpp
-   #define USE_MPU6050     1   // 接了传感器:读真实 IMU,status="ok"
-   // #define USE_MPU6050  0  // 还没接:用 sin 合成,status="simulated"
-   ```
+`board/imu_http/config.h`(**已被 .gitignore 排除,填密码不会上传 GitHub**):
+
+```cpp
+#define WIFI_SSID       "你的WiFi名"          // ← 必改(ESP32 仅支持 2.4GHz)
+#define WIFI_PASS       "你的WiFi密码"        // ← 必改
+#define SERVER_HOST     "192.168.x.x"        // 本机 IP,见 §4.0
+#define SERVER_PORT     8000
+#define GROUP_ID        "G03"
+#define DEVICE_ID       "esp32s3-eye-01"
+#define USE_QMA7981     1                    // 1=读板载传感器;0=合成演示数据
+```
 
 ### 4.4 烧录 & 验证
 
-1. Arduino IDE 打开 `board/imu_http/imu_http.ino`,选开发板 `ESP32 Dev Module`,端口选实际 COM 口,点击"上传"。
-2. 打开 `工具 → 串口监视器`(115200 波特),看到 `HTTP 200` 表示成功。
-3. 把传感器平放静止,串口应打印 `acc≈(0.0, 0.0, 9.8)`,Web 页面状态显示 `ok`。
+**方式 A:命令行(推荐,本项目实际使用)**
 
-**库依赖(Arduino IDE → 工具 → 管理库):**
-- `ArduinoJson` **必须选 6.x 版本**(代码用的是 `StaticJsonDocument`,7.x 已移除该 API)。
-- `Wire` 随 ESP32 板支持包自带,无需另装。
+```bash
+CLI="/c/Program Files/Arduino CLI/arduino-cli.exe"
+
+# 1) 编译(必须带 CDCOnBoot=cdc,否则串口输出走 UART0,USB 口看不到)
+"$CLI" compile --fqbn "esp32:esp32:esp32s3:CDCOnBoot=cdc" board/imu_http
+
+# 2) 上传(端口是烧录口,通常 COM5)
+"$CLI" upload -p COM5 --fqbn "esp32:esp32:esp32s3:CDCOnBoot=cdc" board/imu_http
+
+# 3) ⚠️ 必须复位!否则程序不会启动(S3-EYE 无 UART 桥接,自动复位信号传不到)
+ESPTOOL="/c/Users/user/AppData/Local/Arduino15/packages/esp32/tools/esptool_py/5.3.1/esptool.exe"
+"$ESPTOOL" --port COM5 --after watchdog-reset chip-id
+```
+
+**方式 B:Arduino IDE**
+- 开发板选 **`ESP32S3 Dev Module`**
+- 工具菜单里把 **`USB CDC On Boot` 设为 `Enabled`**
+- 上传后**手动按一下板子上的 RST 键**
+
+**库依赖**:`ArduinoJson` **必须 6.x**(代码用 `StaticJsonDocument`,7.x 已移除)。
+命令行装:`"$CLI" lib install "ArduinoJson@6.21.5"`
+
+**验证成功**:
+```
+[QMA] init OK
+[QMA] 重力校准完成: 1g = 414.2 LSB (采样 60 次, 标称 1024)
+[UP] n=19  acc=(-0.296, -0.710, -0.645) g = (-2.91, -6.96, -6.36) m/s2
+[HTTP] 200, resp={"count":57,"ok":true}
+```
 
 **板端逻辑要点**:
-- 默认每 50ms 采一次(20Hz),每 1s 算均值并上传一次。
-- 每次上传带 `ts_ms`(本地毫秒时间戳)、`group_id`、`device_id`、`status`。
-- WiFi 断连自动重连;HTTP 失败打印状态码便于排错。
-- 真实模式没接传感器时 `status="sensor_fail"`,Web 显示**失败**。
-- 演示模式 `status="simulated"`,Web 显示**蓝色徽章** + "正常(板端演示数据)"。
+- 默认每 50ms 采一次(20Hz),每 1s 算均值并上传一次
+- 上传字段:`ts_ms`、`group_id`、`device_id`、`status`、`acc_*_g`(g)、`acc_*`(m/s²)、`rssi`、`n_samples`
+- **启动时自动做重力校准**:静止时三轴模长恒等于 1g,据此反推真实灵敏度(兼容不同批次芯片)
+- WiFi 断连自动重连;HTTP 失败打印状态码
+- 传感器读不到时 `status="sensor_fail"`;演示模式 `status="simulated"`(Web 显示蓝色徽章)
 
 ---
 
@@ -206,7 +233,7 @@ python scripts\find_local_ip.py
 
 | 验证项 | 操作 | 期望 |
 |--------|------|------|
-| 采集值 | 看串口监视器 | 静止时 acc_z ≈ 9.8,acc_x/acc_y ≈ 0 |
+| 采集值 | 看串口监视器 | 静止时**三轴模长 ≈ 1g**;某个轴 ≈ ±1g,另两轴 ≈ 0 |
 | 服务端原始记录 | 打开 `server/data.json` | 有新条目,timestamp 单调递增 |
 | 页面变化 | 板子动一动 | Web 数字实时变化,曲线跳动 |
 | 停采后保留旧时间 | 拔板子电源或停模拟器 | "最后更新"冻结在停止那一刻,标题变**未更新** |
@@ -222,14 +249,42 @@ python scripts\find_local_ip.py
 
 ## 6. 排错(嵌入式开发排错过程)
 
+### 6.1 ESP32-S3-EYE 专属坑(实测踩过)
+
+| 现象 | 原因 | 解决 |
+|------|------|------|
+| **上传报 `Write timeout`** | 用了 USB 3.0 口,与 S3 原生 USB 兼容性差 | **换到 USB 2.0 口**(黑色内芯) |
+| **烧录成功但串口 0 输出** | S3-EYE **无 UART 桥接芯片**,esptool 自动复位信号传不到,程序停在 bootloader 没启动 | 烧录后执行 `esptool --after watchdog-reset chip-id`,或**手动按 RST 键** |
+| **串口完全没反应**(复位后) | 没设 `CDCOnBoot=cdc`,Serial 输出到 UART0,USB 口看不到 | 编译时加 `CDCOnBoot=cdc` |
+| **端口号会变** | 程序运行时创建自己的 USB CDC 设备 | 烧录口(如 COM5)和运行口(如 COM6)可能不同,`arduino-cli board list` 查看 |
+| **数值偏小/偏大**(如静止模长 0.44g) | 芯片灵敏度与手册标称不符(批次/型号差异) | 已内置**重力自动校准**,启动时静止 1 秒即可;也可用 `board/qma_diag` 诊断 |
+| **烧录后无法再烧录** | 程序不停重启(官方已知问题) | 按住 BOOT → 按 RST → 松 RST → 松 BOOT,进入下载模式 |
+
+### 6.2 通用排错
+
 | 现象 | 排查点 |
 |------|--------|
 | 板子串口反复 `WiFi disconnected` | SSID/密码错;2.4G/5G 频段;WiFi 信号弱 |
 | `HTTP -1` / `connect fail` | 服务端 IP 是否对;PC 防火墙是否放行 8000;板子和 PC 是否同网段 |
-| `I2C scan` 扫不到设备 | 先烧 `board/i2c_scan` 确认;查 VCC 是否 3.3V、SDA/SCL 是否反、线是否插紧 |
-| 数值全是 0 | 传感器没初始化成功;I²C 引脚错;或型号不是 MPU6050 兼容 |
-| 编译报 `StaticJsonDocument` 不存在 | ArduinoJson 装成了 7.x,降级到 6.x |
+| `I2C scan` 扫不到设备 | 先烧 `board/i2c_scan`;S3-EYE 需确认代码里有 `pinMode(INPUT_PULLUP)` |
+| 编译报 `'Wire' was not declared` | `#include "config.h"` 必须在 `#if USE_*` **之前**(否则宏未定义) |
+| 编译报 `StaticJsonDocument` 不存在 | ArduinoJson 装成了 7.x,降到 6.x |
 | 页面一直是"无数据" | 浏览器 `Network` 看 `/api/latest`;`Group ID` 是否与上传一致 |
+| **核心下载极慢/失败** | 见 §6.3 |
+
+### 6.3 ESP32 核心下载(国内网络)
+
+ESP32 核心有 **1.5GB+**(工具链 394MB + riscv32 616MB + 8 个 libs 包),从 GitHub 拉经常失败。
+
+**方法:改写本地索引走加速镜像**
+```python
+# 把 Arduino15/package_esp32_index.json 里的 GitHub URL 加镜像前缀
+p = r'C:\Users\<你>\AppData\Local\Arduino15\package_esp32_index.json'
+s = open(p, encoding='utf-8').read()
+s = s.replace('"https://github.com/', '"https://ghproxy.net/https://github.com/')
+open(p, 'w', encoding='utf-8').write(s)
+```
+大文件用 `curl -C -` 断点续传,放进 `Arduino15/staging/packages/` 让 arduino-cli 识别。
 
 ---
 
@@ -243,11 +298,16 @@ D:\kechengrenwu\123\
 │   └── arduino-ide-setup.md   # Arduino IDE 安装 + 打开 .ino + 烧录全流程(新手看这个)
 ├── board\
 │   ├── imu_http\              # 主 sketch(文件夹名必须与 .ino 同名)
-│   │   ├── imu_http.ino       # ESP32 采集 + WiFi 上传(支持 USE_MPU6050=0 演示模式)
-│   │   ├── config.h           # 你的实际配置(已生成,含 WiFi 密码,不进 git)
+│   │   ├── imu_http.ino       # S3-EYE 采集 + WiFi 上传 + 重力自动校准
+│   │   ├── config.h           # 你的实际配置(含 WiFi 密码,已被 gitignore)
 │   │   └── config.h.example   # 配置模板
-│   └── i2c_scan\
-│       └── i2c_scan.ino       # I2C 扫描 + IMU 型号识别(型号不确定时先烧这个)
+│   ├── i2c_scan\
+│   │   └── i2c_scan.ino       # I2C 扫描 + 传感器识别(排查用)
+│   ├── qma_diag\
+│   │   └── qma_diag.ino       # QMA7981 诊断:量程扫描 + 原始值(排查数值不对时用)
+│   └── serial_test\
+│       └── serial_test.ino    # 最小串口测试(排查 USB CDC 是否正常)
+├── build\                     # 编译产物(.bin/.elf/.map),已 gitignore
 ├── server\
 │   ├── app.py                 # Flask 接收 + 查询 + 页面
 │   ├── requirements.txt
@@ -261,7 +321,8 @@ D:\kechengrenwu\123\
     ├── start_demo.bat         # 一键起服务 + 模拟器(双窗口)
     ├── start_simulator.bat    # 仅起模拟器
     ├── find_local_ip.py       # 列本机 IPv4 + 给出 config.h 写法
-    └── health.py              # 探测 /api/health 和 /api/latest
+    ├── health.py              # 探测 /api/health 和 /api/latest
+    └── push_to_github.bat     # 一键推送到 GitHub
 ```
 
 ---

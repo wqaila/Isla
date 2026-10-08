@@ -1,118 +1,156 @@
 // ============================================================
-//  ESP32 + MPU6050  IMU 传感数据采集 + WiFi HTTP 上传
+//  ESP32-S3-EYE 板载 QMA7981 加速度计 → WiFi HTTP 上传
 //  对应周任务卡:真实传感源、单位与时间、来源组号、失败状态
+//
+//  硬件:ESP32-S3-EYE 板载 QMA7981(三轴加速度计)
+//        I2C: SDA=GPIO4  SCL=GPIO5  地址=0x12
+//        注意:S3-EYE 无外部上拉电阻,必须启用芯片内部上拉
+//  寄存器依据:QST《QMA7981 Datasheet Rev.A》
 // ============================================================
+#include "config.h"          // 必须最先包含:USE_QMA7981 宏在这里定义
 #include <WiFi.h>
 #include <HTTPClient.h>
-#if USE_MPU6050
+#if USE_QMA7981
   #include <Wire.h>
 #endif
 #include <ArduinoJson.h>
-#include "config.h"
 
-// ---------- I2C & MPU6050 ----------
-static const uint8_t MPU_ADDR = 0x68;  // AD0 悬空为 0x68,接 3V3 改 0x69
-static const int I2C_SDA = 21;
-static const int I2C_SCL = 22;
+// ---------- QMA7981 定义 ----------
+static const uint8_t QMA_ADDR    = 0x12;   // 7 位 I2C 地址
+static const int     I2C_SDA     = 4;      // S3-EYE 板载 I2C
+static const int     I2C_SCL     = 5;
+static const uint8_t REG_CHIP_ID = 0x00;   // CHIP_ID(默认值由 NVM 决定)
+static const uint8_t REG_X_LSB   = 0x01;   // 0x01~0x06 三轴数据
+static const uint8_t REG_FSR     = 0x0F;   // 量程
+static const uint8_t REG_PM      = 0x11;   // 电源模式
 
-struct AccelGyro {
-  int16_t ax, ay, az;
-  int16_t gx, gy, gz;
-  int16_t t_raw;
-};
+// ±8g 量程 → 标称 1024 LSB/g(手册值,实际会用重力校准覆盖)
+static const float   LSB_PER_G   = 1024.0f;
+// 校准后的真实灵敏度(LSB/g),由 qma_calibrate() 用重力测定
+static float         g_lsb_per_g = LSB_PER_G;
+static const float   G_TO_MS2    = 9.80665f;
 
-AccelGyro last_sample;
 bool sensor_ok = false;
-bool sensor_mode_demo = false;   // 当前是否为合成演示模式(USE_MPU6050=0)
-unsigned long last_sensor_print = 0;
+uint8_t chip_id_seen = 0;
 
 // ---------- 采样与上传控制 ----------
-static const unsigned long SAMPLE_PERIOD_MS = 50;   // 50ms 采一次
-static const unsigned long UPLOAD_PERIOD_MS = 1000; // 1s 上传一次
+static const unsigned long SAMPLE_PERIOD_MS = 50;   // 50ms 采一次(20Hz)
+static const unsigned long UPLOAD_PERIOD_MS = 1000; // 1s 上传一次(取均值)
 unsigned long last_sample_ms = 0;
 unsigned long last_upload_ms = 0;
 unsigned long http_fail_count = 0;
 
-// 1s 内均值缓存
+// 1s 内均值缓存(单位:g)
 struct SumBuf {
-  double ax=0, ay=0, az=0, gx=0, gy=0, gz=0;
-  int n=0;
+  double ax = 0, ay = 0, az = 0;
+  int n = 0;
 } sumbuf;
 
-// ---------- 工具函数 ----------
-static int16_t swap16(int16_t v) {
-  return (int16_t)(((v & 0x00FF) << 8) | ((v & 0xFF00) >> 8));
+// ---------- I2C 底层 ----------
+#if USE_QMA7981
+static bool i2c_write_reg(uint8_t reg, uint8_t val) {
+  Wire.beginTransmission(QMA_ADDR);
+  Wire.write(reg);
+  Wire.write(val);
+  return Wire.endTransmission() == 0;
 }
 
-bool mpu_init() {
-#if USE_MPU6050
+static bool i2c_read_regs(uint8_t reg, uint8_t *buf, size_t len) {
+  Wire.beginTransmission(QMA_ADDR);
+  Wire.write(reg);
+  if (Wire.endTransmission(false) != 0) return false;
+  if (Wire.requestFrom((int)QMA_ADDR, (int)len) != (int)len) return false;
+  for (size_t i = 0; i < len; ++i) buf[i] = Wire.read();
+  return true;
+}
+
+// 14 位二进制补码还原:MSB=ACC<13:6>, LSB=ACC<5:0> 在 bit7~bit2
+static inline int16_t compose14(uint8_t lsb, uint8_t msb) {
+  uint16_t u = (uint16_t)(((uint16_t)msb << 8) | ((uint16_t)lsb & 0xFC)) >> 2;
+  if (u & 0x2000) return (int16_t)(u | 0xC000);  // 负数符号扩展
+  return (int16_t)u;
+}
+
+bool qma_init() {
+  // 【关键】S3-EYE 无外部上拉,必须开内部上拉
+  pinMode(I2C_SDA, INPUT_PULLUP);
+  pinMode(I2C_SCL, INPUT_PULLUP);
   Wire.begin(I2C_SDA, I2C_SCL);
   Wire.setClock(400000);
-  Wire.beginTransmission(MPU_ADDR);
-  if (Wire.endTransmission() != 0) {
-    Serial.println("[MPU] not found on I2C bus");
+
+  // 1) 读 CHIP_ID 自检
+  if (!i2c_read_regs(REG_CHIP_ID, &chip_id_seen, 1)) {
+    Serial.println("[QMA] I2C 无响应!检查开发板型号与引脚(应为 SDA=4/SCL=5)");
     return false;
   }
-  // 0x6B PWR_MGMT_1 写 0 唤醒
-  Wire.beginTransmission(MPU_ADDR);
-  Wire.write(0x6B);
-  Wire.write(0x00);
-  Wire.endTransmission();
-  delay(100);
+  Serial.printf("[QMA] CHIP_ID = 0x%02X (常见 0xE7;随批次变化,通信正常即可)\n", chip_id_seen);
+
+  // 2) 设量程 ±8g
+  if (!i2c_write_reg(REG_FSR, 0x04)) {
+    Serial.println("[QMA] 设置量程失败");
+    return false;
+  }
+  // 3) 退出 standby,进入 Active(上电默认 standby)
+  uint8_t pm = 0;
+  if (!i2c_read_regs(REG_PM, &pm, 1)) return false;
+  if (!i2c_write_reg(REG_PM, pm | 0x80)) return false;
+
+  delay(20);  // 唤醒约 1ms,留余量
   return true;
-#else
-  // USE_MPU6050=0 时跳过真实传感器,返回 true 表示"链路层 OK"
-  Serial.println("[MPU] USE_MPU6050=0, using synthetic demo data");
+}
+
+// 读一次三轴原始值(LSB)
+static void qma_read_raw(int16_t &x, int16_t &y, int16_t &z) {
+  uint8_t raw[6] = {0};
+  i2c_read_regs(REG_X_LSB, raw, 6);
+  x = compose14(raw[0], raw[1]);
+  y = compose14(raw[2], raw[3]);
+  z = compose14(raw[4], raw[5]);
+}
+
+// 读一次三轴,输出单位 g(使用校准后的灵敏度)
+bool qma_read(float &ax_g, float &ay_g, float &az_g) {
+  int16_t x, y, z;
+  qma_read_raw(x, y, z);
+  ax_g = (float)x / g_lsb_per_g;
+  ay_g = (float)y / g_lsb_per_g;
+  az_g = (float)z / g_lsb_per_g;
   return true;
+}
+
+// 用重力自动校准:静止时三轴模长恒等于 1g,据此反推真实灵敏度。
+// 不依赖数据手册的标称值,兼容 QMA7981 / QMA6100P 等不同批次芯片。
+bool qma_calibrate() {
+  const int N = 60;
+  double sum = 0;
+  int ok = 0;
+  for (int i = 0; i < N; i++) {
+    int16_t x, y, z;
+    qma_read_raw(x, y, z);
+    double m = sqrt((double)x * x + (double)y * y + (double)z * z);
+    if (m > 10) { sum += m; ok++; }
+    delay(15);
+  }
+  if (ok < N / 2) {
+    Serial.println("[QMA] 校准失败(数据异常),改用标称值 1024");
+    g_lsb_per_g = 1024.0f;
+    return false;
+  }
+  g_lsb_per_g = (float)(sum / ok);
+  Serial.printf("[QMA] 重力校准完成: 1g = %.1f LSB (采样 %d 次, 标称 1024)\n",
+                g_lsb_per_g, ok);
+  return true;
+}
 #endif
+
+// ---------- 演示模式:合成"轻微摇晃+重力"信号 ----------
+static void sim_generate(float t, float &ax_g, float &ay_g, float &az_g) {
+  ax_g = 0.020f * sinf(0.7f * t) + 0.003f * (((float)random(1000)) / 1000.0f - 0.5f);
+  ay_g = 0.015f * cosf(0.5f * t) + 0.003f * (((float)random(1000)) / 1000.0f - 0.5f);
+  az_g = 1.000f + 0.010f * sinf(1.0f * t) + 0.003f * (((float)random(1000)) / 1000.0f - 0.5f);
 }
 
-// 演示模式:按时间 t (秒) 生成与 MPU6050 同量纲的 int16 原始读数
-//   量程 ±2g / ±250°/s,后面 build_and_upload 会按 16384 LSB/g 与 131 LSB/(°/s)
-//   还原成物理单位(m/s² 和 °/s),Web 上看到的波形与真实 IMU 一致。
-static AccelGyro sim_generate(float t) {
-  AccelGyro s;
-  float ax_ms2 = 0.20f  * sinf(0.7f * t) + 0.03f * (((float)random(1000)) / 1000.0f - 0.5f);
-  float ay_ms2 = 0.15f  * cosf(0.5f * t) + 0.03f * (((float)random(1000)) / 1000.0f - 0.5f);
-  float az_ms2 = 9.80665f + 0.10f * sinf(1.0f * t) + 0.03f * (((float)random(1000)) / 1000.0f - 0.5f);
-  float gx_dps = 0.5f   * sinf(0.4f * t) + 0.10f * (((float)random(1000)) / 1000.0f - 0.5f);
-  float gy_dps = 0.5f   * cosf(0.6f * t) + 0.10f * (((float)random(1000)) / 1000.0f - 0.5f);
-  float gz_dps = 5.0f   * sinf(0.3f * t) + 0.10f * (((float)random(1000)) / 1000.0f - 0.5f);
-  // 反推为 ±2g / ±250°/s 下的 LSB
-  s.ax    = (int16_t)((ax_ms2 / 9.80665f) * 16384.0f);
-  s.ay    = (int16_t)((ay_ms2 / 9.80665f) * 16384.0f);
-  s.az    = (int16_t)((az_ms2 / 9.80665f) * 16384.0f);
-  s.gx    = (int16_t)(gx_dps * 131.0f);
-  s.gy    = (int16_t)(gy_dps * 131.0f);
-  s.gz    = (int16_t)(gz_dps * 131.0f);
-  // 室温 26℃,由 MPU 公式反算:t_c = raw/340 + 36.53  →  raw = (t_c - 36.53)*340
-  s.t_raw = (int16_t)((26.0f - 36.53f) * 340.0f);
-  return s;
-}
-
-bool mpu_read(AccelGyro &out) {
-#if USE_MPU6050
-  Wire.beginTransmission(MPU_ADDR);
-  Wire.write(0x3B);  // ACCEL_XOUT_H
-  if (Wire.endTransmission(false) != 0) return false;
-  Wire.requestFrom((int)MPU_ADDR, 14);
-  if (Wire.available() < 14) return false;
-  uint8_t b[14];
-  for (int i = 0; i < 14; ++i) b[i] = Wire.read();
-  out.ax = (int16_t)((b[0] << 8) | b[1]);
-  out.ay = (int16_t)((b[2] << 8) | b[3]);
-  out.az = (int16_t)((b[4] << 8) | b[5]);
-  out.t_raw = (int16_t)((b[6] << 8) | b[7]);
-  out.gx = (int16_t)((b[8] << 8) | b[9]);
-  out.gy = (int16_t)((b[10] << 8) | b[11]);
-  out.gz = (int16_t)((b[12] << 8) | b[13]);
-  return true;
-#else
-  out = sim_generate(millis() / 1000.0f);
-  return true;
-#endif
-}
-
+// ---------- WiFi ----------
 void wifi_connect() {
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASS);
@@ -134,46 +172,28 @@ void wifi_connect() {
 }
 
 bool upload_payload(const String &json_body) {
-  if (WiFi.status() != WL_CONNECTED) {
-    wifi_connect();
-  }
+  if (WiFi.status() != WL_CONNECTED) wifi_connect();
   HTTPClient http;
   String url = String("http://") + SERVER_HOST + ":" + SERVER_PORT + "/api/data";
   http.begin(url);
   http.addHeader("Content-Type", "application/json");
   int code = http.POST(json_body);
+  bool ok = false;
   if (code > 0) {
     Serial.printf("[HTTP] %d, resp=%s\n", code, http.getString().c_str());
-    if (code == 200) { http.end(); return true; }
+    ok = (code == 200);
   } else {
     Serial.printf("[HTTP] err %s\n", http.errorToString(code).c_str());
   }
   http.end();
-  return false;
+  return ok;
 }
 
 void build_and_upload() {
-  // 1s 内均值
   double ax = sumbuf.n ? sumbuf.ax / sumbuf.n : 0;
   double ay = sumbuf.n ? sumbuf.ay / sumbuf.n : 0;
   double az = sumbuf.n ? sumbuf.az / sumbuf.n : 0;
-  double gx = sumbuf.gx / max(1, sumbuf.n);
-  double gy = sumbuf.gy / max(1, sumbuf.n);
-  double gz = sumbuf.gz / max(1, sumbuf.n);
-  // 温度(MPU6050 内部温度,℃)
-  double temp_c = (sumbuf.t_raw / 340.0) + 36.53;
-  // MPU6050 量程默认 ±2g / ±250°/s,换算成物理单位
-  //   accel  : 16384 LSB/g
-  //   gyro   : 131.0 LSB/(°/s)
-  double ax_ms2 = (ax / 16384.0) * 9.80665;
-  double ay_ms2 = (ay / 16384.0) * 9.80665;
-  double az_ms2 = (az / 16384.0) * 9.80665;
-  double gx_dps = gx / 131.0;
-  double gy_dps = gy / 131.0;
-  double gz_dps = gz / 131.0;
   int n_in_buf = sumbuf.n;
-
-  // 清空缓存
   sumbuf = SumBuf{};
 
   StaticJsonDocument<512> doc;
@@ -182,64 +202,68 @@ void build_and_upload() {
   doc["ts_ms"]     = (uint64_t)millis();
   doc["uptime_s"]  = millis() / 1000.0;
   doc["n_samples"] = n_in_buf;
-#if USE_MPU6050
+  doc["sensor"]    = "QMA7981";
+#if USE_QMA7981
   doc["status"]    = sensor_ok ? "ok" : "sensor_fail";
 #else
-  doc["status"]    = "simulated";   // 演示模式,数据由板内合成,链路真实
-  doc["mode"]      = "demo";        // 给 Web 用,UI 可显示"演示数据"
+  doc["status"]    = "simulated";
+  doc["mode"]      = "demo";
 #endif
-  doc["acc_x"]     = ax_ms2;
-  doc["acc_y"]     = ay_ms2;
-  doc["acc_z"]     = az_ms2;
-  doc["gyro_x"]    = gx_dps;
-  doc["gyro_y"]    = gy_dps;
-  doc["gyro_z"]    = gz_dps;
-  doc["temp_c"]    = temp_c;
+  // 加速度:同时给 g 和 m/s²,便于核对单位
+  doc["acc_x_g"]   = ax;
+  doc["acc_y_g"]   = ay;
+  doc["acc_z_g"]   = az;
+  doc["acc_x"]     = ax * G_TO_MS2;
+  doc["acc_y"]     = ay * G_TO_MS2;
+  doc["acc_z"]     = az * G_TO_MS2;
   doc["rssi"]      = WiFi.RSSI();
 
   String body;
   serializeJson(doc, body);
 
-  Serial.printf("[UP] n=%d  acc=(%.2f,%.2f,%.2f)  gyro=(%.2f,%.2f,%.2f)  T=%.1f\n",
-                n_in_buf, ax_ms2, ay_ms2, az_ms2,
-                gx_dps, gy_dps, gz_dps, temp_c);
-  bool ok = upload_payload(body);
-  if (!ok) http_fail_count++;
+  Serial.printf("[UP] n=%d  acc=(%.3f, %.3f, %.3f) g  = (%.2f, %.2f, %.2f) m/s2\n",
+                n_in_buf, ax, ay, az, ax * G_TO_MS2, ay * G_TO_MS2, az * G_TO_MS2);
+  if (!upload_payload(body)) http_fail_count++;
 }
 
-// ============================================================
-//  setup / loop
 // ============================================================
 void setup() {
   Serial.begin(115200);
   delay(200);
   Serial.println();
-  Serial.println("=== ESP32 IMU HTTP Uploader ===");
+  Serial.println("=== ESP32-S3-EYE QMA7981 Uploader ===");
   Serial.printf("Group=%s  Device=%s  Server=%s:%d\n",
                 GROUP_ID, DEVICE_ID, SERVER_HOST, SERVER_PORT);
 
   wifi_connect();
-  sensor_ok = mpu_init();
-#if USE_MPU6050
-  Serial.println(sensor_ok ? "[MPU] init OK" : "[MPU] init FAIL (will keep retrying each sample)");
+#if USE_QMA7981
+  sensor_ok = qma_init();
+  Serial.println(sensor_ok ? "[QMA] init OK" : "[QMA] init FAIL");
+  if (sensor_ok) {
+    Serial.println("[QMA] 请保持板子静止 1 秒,正在做重力校准...");
+    qma_calibrate();
+  }
 #else
-  sensor_mode_demo = true;
-  Serial.println("[MPU] demo mode, every sample will succeed");
+  Serial.println("[QMA] demo mode (USE_QMA7981=0), using synthetic data");
 #endif
 }
 
 void loop() {
   unsigned long now = millis();
 
-  // ---- 周期性采样 ----
+  // ---- 周期采样 ----
   if (now - last_sample_ms >= SAMPLE_PERIOD_MS) {
     last_sample_ms = now;
-    AccelGyro s;
-    if (mpu_read(s)) {
-      last_sample = s;
-      sumbuf.ax += s.ax; sumbuf.ay += s.ay; sumbuf.az += s.az;
-      sumbuf.gx += s.gx; sumbuf.gy += s.gy; sumbuf.gz += s.gz;
-      sumbuf.t_raw += s.t_raw;
+    float ax, ay, az;
+    bool got = false;
+#if USE_QMA7981
+    got = qma_read(ax, ay, az);
+#else
+    sim_generate(now / 1000.0f, ax, ay, az);
+    got = true;
+#endif
+    if (got) {
+      sumbuf.ax += ax; sumbuf.ay += ay; sumbuf.az += az;
       sumbuf.n++;
       sensor_ok = true;
     } else {
@@ -250,14 +274,10 @@ void loop() {
   // ---- 周期上传 ----
   if (now - last_upload_ms >= UPLOAD_PERIOD_MS) {
     last_upload_ms = now;
-    if (sumbuf.n > 0) {
-      build_and_upload();
-    } else {
-      Serial.println("[UP] skip (no samples in last 1s)");
-    }
+    if (sumbuf.n > 0) build_and_upload();
   }
 
-  // ---- 看门狗:WiFi 掉线重连 ----
+  // ---- WiFi 掉线重连 ----
   static unsigned long last_wifi_check = 0;
   if (now - last_wifi_check > 5000) {
     last_wifi_check = now;

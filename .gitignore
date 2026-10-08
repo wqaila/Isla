@@ -27,9 +27,14 @@ board/*/config.h
 *.env
 
 # ----- Arduino / PlatformIO 编译产物 -----
+build/
 board/build/
+board/*/build/
 board/.pio/
 board/.vscode/
+*.bin
+*.elf
+*.map
 
 # ----- IDE -----
 .vscode/
