@@ -20,6 +20,10 @@ server/data.json
 logs/
 *.log
 
+# ----- 本地备份 -----
+_backup_*/
+*_backup/
+
 # ----- 板端(含 WiFi 密码) -----
 board/config.h
 board/*/config.h

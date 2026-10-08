@@ -96,10 +96,51 @@ python app.py
 
 服务说明:
 - 数据全部落到 `server/data.json`(自动生成),便于直接打开核对原始记录。
-- `POST /api/data` 接收板端上传;
-- `GET /api/latest?group_id=G03` 查最新一条;
-- `GET /api/history?group_id=G03&limit=60` 查最近 60 条;
-- `GET /api/groups` 看都有哪些组在上传。
+- 板端默认 **5Hz 上传**(200ms 一条),前端默认 **500ms 拉取**。
+
+### 2.1 API 一览
+
+| 接口 | 说明 |
+|------|------|
+| `POST /api/data` | 接收板端/模拟器上传 |
+| `GET /api/latest?group_id=G03` | 最新一条 |
+| `GET /api/history?group_id=G03&limit=60&since_ms=...` | 历史记录(支持时间范围过滤) |
+| `GET /api/stats?group_id=G03&since_ms=...` | 统计(max/min/avg/标准差/峰峰值)+ 数据质量 |
+| `GET /api/export.csv?group_id=G03` | 导出 CSV(带 BOM,Excel 中文不乱码) |
+| `GET /api/groups` | 有哪些组在上传 |
+| `GET /api/health` | 服务健康检查 |
+
+### 2.2 Web 平台功能
+
+升级为完整的 **IMU 实时监测与数据分析平台**:
+
+- **系统状态栏**:服务状态 / 设备在线-延迟-离线 / 更新时间 / Group ID / 设备 ID
+- **数据概览卡片**:X/Y/Z 加速度、合加速度、RSSI、采样数(带趋势与异常高亮)
+- **实时图表**:三轴加速度图 + 合加速度图,支持暂停/继续/清空
+- **设备状态面板**:设备 ID、传感器型号、运行时长、RSSI、接收间隔、累计数量
+- **数据质量**:实际采样率、丢包、最大间隔、重复时间戳、质量分(0-100)
+- **异常检测**:数据延迟、加速度异常、RSSI 过低、字段缺失、时间戳异常等
+- **历史数据分析**:5 档时间范围(1min/5min/30min/1h/全部)+ 统计表
+- **数据导出**:CSV / JSON
+- **姿态可视化**:基于重力方向的粗略估计(**仅加速度数据,无法得到准确绝对姿态**)
+- **交互**:刷新频率选择、Group ID 持久化、原始 JSON 折叠/复制、曲线显隐
+
+> 阈值等配置集中在 `server/static/js/config.js`,修改阈值不用翻代码。
+
+### 2.3 前端结构
+
+```
+server/
+├── templates/index.html      页面骨架
+├── static/
+│   ├── css/style.css         样式
+│   ├── js/config.js          集中配置(阈值/频率/配色)
+│   ├── js/utils.js           工具函数
+│   ├── js/api.js             API 请求层
+│   ├── js/charts.js          图表 + 姿态可视化
+│   ├── js/app.js             主逻辑(状态/UI/轮询)
+│   └── vendor/chart.umd.min.js   Chart.js(本地化,不依赖 CDN)
+```
 
 ---
 

@@ -35,7 +35,7 @@ uint8_t chip_id_seen = 0;
 
 // ---------- 采样与上传控制 ----------
 static const unsigned long SAMPLE_PERIOD_MS = 50;   // 50ms 采一次(20Hz)
-static const unsigned long UPLOAD_PERIOD_MS = 1000; // 1s 上传一次(取均值)
+static const unsigned long UPLOAD_PERIOD_MS = 200;  // 200ms 上传一次(5Hz),曲线更密更流畅
 unsigned long last_sample_ms = 0;
 unsigned long last_upload_ms = 0;
 unsigned long http_fail_count = 0;
