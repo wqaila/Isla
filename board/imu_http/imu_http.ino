@@ -174,14 +174,16 @@ void wifi_connect() {
 bool upload_payload(const String &json_body) {
   if (WiFi.status() != WL_CONNECTED) wifi_connect();
   HTTPClient http;
+  http.setTimeout(2500);          // 限制单次请求耗时,避免阻塞主循环
+  http.setConnectTimeout(2000);
   String url = String("http://") + SERVER_HOST + ":" + SERVER_PORT + "/api/data";
   http.begin(url);
   http.addHeader("Content-Type", "application/json");
   int code = http.POST(json_body);
   bool ok = false;
   if (code > 0) {
-    Serial.printf("[HTTP] %d, resp=%s\n", code, http.getString().c_str());
     ok = (code == 200);
+    if (!ok) Serial.printf("[HTTP] %d\n", code);
   } else {
     Serial.printf("[HTTP] err %s\n", http.errorToString(code).c_str());
   }
@@ -189,7 +191,8 @@ bool upload_payload(const String &json_body) {
   return ok;
 }
 
-void build_and_upload() {
+// req_id 非空时表示这是响应某个采集任务,数据里会带上 request_id
+void build_and_upload(const char *req_id = nullptr) {
   double ax = sumbuf.n ? sumbuf.ax / sumbuf.n : 0;
   double ay = sumbuf.n ? sumbuf.ay / sumbuf.n : 0;
   double az = sumbuf.n ? sumbuf.az / sumbuf.n : 0;
@@ -203,6 +206,7 @@ void build_and_upload() {
   doc["uptime_s"]  = millis() / 1000.0;
   doc["n_samples"] = n_in_buf;
   doc["sensor"]    = "QMA7981";
+  if (req_id && req_id[0]) doc["request_id"] = req_id;
 #if USE_QMA7981
   doc["status"]    = sensor_ok ? "ok" : "sensor_fail";
 #else
@@ -221,14 +225,128 @@ void build_and_upload() {
   String body;
   serializeJson(doc, body);
 
-  Serial.printf("[UP] n=%d  acc=(%.3f, %.3f, %.3f) g  = (%.2f, %.2f, %.2f) m/s2\n",
-                n_in_buf, ax, ay, az, ax * G_TO_MS2, ay * G_TO_MS2, az * G_TO_MS2);
+  // 单次 HTTP 往返耗时(用于诊断上传是否成为瓶颈)
+  unsigned long t_http = millis();
   if (!upload_payload(body)) http_fail_count++;
+  t_http = millis() - t_http;
+
+  // 日志节流:每秒最多打印 1 行。
+  // 既保留可观测性(能看出真实上传频率),又避免大量 Serial 写入拖慢主循环。
+  static unsigned long last_log_ms = 0;
+  static int up_since_log = 0;
+  static unsigned long last_http_ms = 0;
+  up_since_log++;
+  last_http_ms = t_http;
+  if (millis() - last_log_ms >= 1000) {
+    Serial.printf("[UP] %d 条/秒  http=%lums  n=%d  acc=(%.3f, %.3f, %.3f) g\n",
+                  up_since_log, last_http_ms, n_in_buf, ax, ay, az);
+    last_log_ms = millis();
+    up_since_log = 0;
+  }
+}
+
+// ============================================================
+//  第 2 周:命令通道(Web 远程采集指令)
+// ============================================================
+static bool periodic_paused = false;   // 暂停周期上报(命令通道保持)
+static unsigned long last_cmd_poll_ms = 0;
+// 命令轮询间隔:太短会频繁阻塞主循环(每次 HTTP 约数百 ms),影响 5Hz 上传
+// 命令轮询周期。实测 2s 时"采集一次"端到端要 7~8s 才完成,
+// 缩到 1s 可把等待领取的时间减半(配合 20Hz 采样 + 5Hz 上传的周期上报)
+static const unsigned long CMD_POLL_PERIOD_MS = 1000;
+
+// 立即采一次并上传(带 request_id)
+static void sample_now_and_upload(const char *req_id) {
+  sumbuf = SumBuf{};
+#if USE_QMA7981
+  for (int i = 0; i < 5; i++) {
+    float ax, ay, az;
+    if (qma_read(ax, ay, az)) {
+      sumbuf.ax += ax; sumbuf.ay += ay; sumbuf.az += az; sumbuf.n++;
+      sensor_ok = true;
+    }
+    delay(20);
+  }
+#else
+  float ax, ay, az;
+  sim_generate(millis() / 1000.0f, ax, ay, az);
+  sumbuf.ax += ax; sumbuf.ay += ay; sumbuf.az += az; sumbuf.n = 1;
+#endif
+  build_and_upload(req_id);
+}
+
+// 回执:告诉服务器"我收到了"或"执行失败"
+static void send_ack(const char *req_id, const char *stage, const char *note = "") {
+  StaticJsonDocument<256> doc;
+  doc["request_id"] = req_id;
+  doc["device_id"]  = DEVICE_ID;
+  doc["stage"]      = stage;
+  if (note && note[0]) doc["note"] = note;
+  String body;
+  serializeJson(doc, body);
+
+  HTTPClient http;
+  http.setTimeout(2500);
+  http.setConnectTimeout(2000);
+  String url = String("http://") + SERVER_HOST + ":" + SERVER_PORT + "/api/ack";
+  http.begin(url);
+  http.addHeader("Content-Type", "application/json");
+  int code = http.POST(body);
+  Serial.printf("[ACK] %s -> %s : %d\n", req_id, stage, code);
+  http.end();
+}
+
+// 轮询服务器有没有派给自己的任务
+static void poll_command() {
+  HTTPClient http;
+  http.setTimeout(2500);          // 避免长时间阻塞主循环
+  http.setConnectTimeout(2000);
+  String url = String("http://") + SERVER_HOST + ":" + SERVER_PORT +
+               "/api/command?device_id=" + DEVICE_ID;
+  http.begin(url);
+  int code = http.GET();
+  if (code != 200) {
+    http.end();
+    return;
+  }
+  String payload = http.getString();
+  http.end();
+
+  StaticJsonDocument<512> doc;
+  DeserializationError err = deserializeJson(doc, payload);
+  if (err) return;
+
+  JsonObject cmd = doc["command"];
+  if (cmd.isNull()) return;
+
+  const char *req_id = cmd["request_id"] | "";
+  const char *action = cmd["action"] | "sample";
+  if (!req_id[0]) return;
+
+  Serial.printf("[CMD] 收到任务 %s action=%s\n", req_id, action);
+
+  if (strcmp(action, "pause") == 0) {
+    periodic_paused = true;
+    send_ack(req_id, "completed", "periodic paused");   // 无需采集数据,直接完成
+    Serial.println("[CMD] 已暂停周期上报(命令通道保持)");
+  } else if (strcmp(action, "resume") == 0) {
+    periodic_paused = false;
+    send_ack(req_id, "completed", "periodic resumed");
+    Serial.println("[CMD] 已恢复周期上报");
+  } else {
+    // 默认 sample:先回执"已接收",再立即采一次并带上 request_id 上传
+    send_ack(req_id, "received");
+    sample_now_and_upload(req_id);
+  }
 }
 
 // ============================================================
 void setup() {
   Serial.begin(115200);
+  // ⚠️ 关键:S3-EYE 是原生 USB CDC。主机没打开串口监视器时,
+  // Serial 写入会阻塞等待主机取数据(实测把 5Hz 上传拖成 0.5Hz)。
+  // 设为 0 = 写不进去就直接丢弃,绝不阻塞主循环。
+  Serial.setTxTimeoutMs(0);
   delay(200);
   Serial.println();
   Serial.println("=== ESP32-S3-EYE QMA7981 Uploader ===");
@@ -252,8 +370,12 @@ void loop() {
   unsigned long now = millis();
 
   // ---- 周期采样 ----
-  if (now - last_sample_ms >= SAMPLE_PERIOD_MS) {
-    last_sample_ms = now;
+  // 用 while 补帧:上一轮若被 HTTP 等耗时操作拖长,把错过的采样补回来,
+  // 保证 20Hz 采样率不退化(上限 8 次,避免长时间阻塞后一次性爆发)
+  int catchup = 0;
+  while (now - last_sample_ms >= SAMPLE_PERIOD_MS && catchup < 8) {
+    last_sample_ms += SAMPLE_PERIOD_MS;
+    catchup++;
     float ax, ay, az;
     bool got = false;
 #if USE_QMA7981
@@ -271,10 +393,16 @@ void loop() {
     }
   }
 
-  // ---- 周期上传 ----
-  if (now - last_upload_ms >= UPLOAD_PERIOD_MS) {
+  // ---- 周期上传(被暂停时跳过,但命令通道继续工作) ----
+  if (!periodic_paused && (now - last_upload_ms >= UPLOAD_PERIOD_MS)) {
     last_upload_ms = now;
     if (sumbuf.n > 0) build_and_upload();
+  }
+
+  // ---- 命令轮询(第 2 周:接收 Web 下发的采集任务) ----
+  if (now - last_cmd_poll_ms >= CMD_POLL_PERIOD_MS) {
+    last_cmd_poll_ms = now;
+    if (WiFi.status() == WL_CONNECTED) poll_command();
   }
 
   // ---- WiFi 掉线重连 ----

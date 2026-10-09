@@ -11,6 +11,17 @@ const CONFIG = {
     exportCsv: "/api/export.csv",
     health: "/api/health",
     groups: "/api/groups",
+    // 第 2 周:远程采集任务
+    taskCreate: "/api/task",      // POST 创建任务
+    taskGet: "/api/task",         // GET /api/task/<id> 查询状态
+    taskList: "/api/tasks",       // GET /api/tasks 任务列表
+  },
+
+  // ---------- 远程采集任务 ----------
+  task: {
+    pollIntervalMs: 1000,    // 任务状态轮询间隔
+    pollTimeoutMs: 20000,    // 前端等待任务完成的上限(超时后不再轮询,以服务器状态为准)
+    historyLimit: 5,         // 最近任务列表条数
   },
 
   // ---------- 默认值 ----------
@@ -19,20 +30,38 @@ const CONFIG = {
   storageKeyFreq: "imu_refresh_ms",      // 刷新频率持久化
 
   // ---------- 数据刷新频率(ms) ----------
+  // 板端 5Hz(200ms)上传,前端默认 200ms 拉取,保证每个新数据点都能被及时取到。
   refreshOptions: [
+    { label: "100ms", value: 100 },
     { label: "200ms", value: 200 },
     { label: "500ms", value: 500 },
     { label: "1s", value: 1000 },
     { label: "2s", value: 2000 },
-    { label: "5s", value: 5000 },
   ],
-  defaultRefreshMs: 500,
+  defaultRefreshMs: 200,
 
   // ---------- 图表 ----------
   chart: {
-    // 板端上传频率已提升到 5Hz(200ms),150 点 ≈ 30 秒窗口,兼顾流畅与信息量
-    maxPoints: 150,
+    // 板端 5Hz(200ms)上传,300 点 ≈ 60 秒窗口,兼顾流畅与信息量
+    maxPoints: 300,
     yPadding: 0.15,         // Y 轴上下留白比例
+
+    // 渲染帧率:用 requestAnimationFrame 驱动,按此帧率节流重绘
+    // 144fps ≈ 6.94ms/帧。显示器不支持高刷时浏览器会自动降到实际刷新率。
+    fps: 144,
+
+    // 曲线动画时长(ms):略小于数据到达间隔(200ms),
+    // 避免上一段动画还没走完就来新点导致跳变或堆积
+    animationMs: 150,
+
+    // 历史图数据量大,单独限制点数与帧率,避免卡顿
+    historyMaxPoints: 800,
+    historyFps: 120,
+
+    // 历史图的刷新间隔(ms)。
+    // 实时曲线跟数据走(200ms);历史是"分析视图",1s 更新一次足够,
+    // 更新太勤反而整条线一直在平移,看着就是一跳一跳。
+    historyRefreshMs: 1000,
   },
 
   // ---------- 设备在线状态判定(基于最后收到数据的时间) ----------

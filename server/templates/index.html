@@ -118,6 +118,38 @@
       </div>
     </section>
 
+    <!-- ========== 远程采集任务(第 2 周) ========== -->
+    <section class="card" id="taskCard">
+      <div class="card-head">
+        <h2>远程采集任务</h2>
+        <div class="card-actions">
+          <button id="taskSampleBtn" class="btn small primary" type="button">🎯 采集一次</button>
+          <button id="taskPauseBtn" class="btn small" type="button">⏸ 暂停周期上报</button>
+          <button id="taskResumeBtn" class="btn small" type="button">▶ 恢复周期上报</button>
+          <button id="taskRefreshBtn" class="btn small" type="button">刷新列表</button>
+        </div>
+      </div>
+      <div class="task-current" id="taskCurrent">
+        <div class="muted">尚无进行中的任务。点击"采集一次"发起远程采集,或在暂停周期上报后验证命令通道仍可用。</div>
+      </div>
+      <div class="task-history">
+        <div class="task-history-title">最近任务(当前分组)</div>
+        <div class="table-scroll">
+          <table class="stats" id="taskHistoryTable">
+            <thead>
+              <tr><th>创建时间</th><th>动作</th><th>状态</th><th>request_id</th><th>耗时</th></tr>
+            </thead>
+            <tbody>
+              <tr><td colspan="5" class="muted">暂无任务记录</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+      <div class="hint">
+        流程:Web 提交任务 → 设备轮询拉取 → 执行(采集 / 暂停 / 恢复)→ 回执。状态流转:pending(待领取)→ received(设备已领取)→ completed / failed / timeout。超时通常意味着设备离线或网络不通,<b>历史数据不会被误标为本次结果</b>(每次任务有独立 request_id)。
+      </div>
+    </section>
+
     <!-- ========== 异常检测 ========== -->
     <section class="card">
       <div class="card-head"><h2>异常检测</h2></div>

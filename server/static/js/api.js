@@ -64,5 +64,51 @@ const Api = (() => {
     return u;
   }
 
-  return { request, latest, history, stats, health, groups, exportCsvUrl };
+  /** POST JSON(远程采集任务用) */
+  async function postJson(url, body, { timeoutMs = 8000 } = {}) {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+    try {
+      const resp = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+        signal: ctrl.signal,
+        cache: "no-store",
+      });
+      if (!resp.ok) {
+        let detail = `HTTP ${resp.status}`;
+        try {
+          const j = await resp.json();
+          if (j && j.error) detail = j.error;
+        } catch (_) { /* 保留 HTTP 状态码 */ }
+        return { ok: false, error: detail, status: resp.status };
+      }
+      return await resp.json();
+    } catch (e) {
+      const msg = e && e.name === "AbortError" ? "请求超时" : (e && e.message) || "网络错误";
+      return { ok: false, error: msg };
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  /** 创建远程采集任务。action: sample | pause | resume */
+  function createTask(groupId, action = "sample") {
+    return postJson(CONFIG.api.taskCreate, { group_id: groupId, action });
+  }
+
+  /** 查询单个任务状态 */
+  function getTask(requestId) {
+    return request(`${CONFIG.api.taskGet}/${encodeURIComponent(requestId)}?_=${nowMs()}`);
+  }
+
+  /** 任务列表(最近 N 条,按分组过滤) */
+  function tasks(groupId, { limit = 5 } = {}) {
+    const u = `${CONFIG.api.taskList}?group_id=${encodeURIComponent(groupId)}&limit=${limit}&_=${nowMs()}`;
+    return request(u);
+  }
+
+  return { request, postJson, latest, history, stats, health, groups, exportCsvUrl,
+           createTask, getTask, tasks };
 })();

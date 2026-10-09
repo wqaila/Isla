@@ -17,6 +17,7 @@ venv/
 
 # ----- 运行时生成的原始数据(任务卡要求手开核对,仓库里就别污染 git) -----
 server/data.json
+server/tasks.json
 logs/
 *.log
 

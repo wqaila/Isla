@@ -17,20 +17,67 @@ from __future__ import annotations
 import json
 import os
 import time
+import uuid
 from collections import deque
 from pathlib import Path
-from threading import Lock
+from threading import Lock, RLock
 
 from flask import Flask, jsonify, render_template, request
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_FILE = BASE_DIR / "data.json"
+TASK_FILE = BASE_DIR / "tasks.json"
 MAX_RECORDS = 5000  # 内存里最多保留这么多,旧的落盘但不再驻留
+MAX_TASKS = 200     # 内存里保留的任务数
+TASK_TIMEOUT_MS = 15000   # 任务超时时间:15 秒内没完成算超时
 
 app = Flask(__name__, static_folder="static", template_folder="templates")
 
 _lock = Lock()
 _records: deque[dict] = deque(maxlen=MAX_RECORDS)
+
+# ---------- 采集任务(第 2 周:Web 远程采集指令) ----------
+# 注意:必须用 RLock(可重入锁),因为 _persist_tasks() 内部也会获取该锁,
+# 若用普通 Lock,在持有锁时调用 _persist_tasks() 会死锁。
+_task_lock = RLock()
+_tasks: dict[str, dict] = {}     # request_id -> task
+
+
+def _persist_tasks():
+    """任务落盘,便于重启后回看(仅保留最近 MAX_TASKS 条)。"""
+    try:
+        with _task_lock:
+            items = sorted(_tasks.values(), key=lambda t: t["created_at_ms"])[-MAX_TASKS:]
+        with TASK_FILE.open("w", encoding="utf-8") as f:
+            json.dump(items, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"[server] persist tasks failed: {e}")
+
+
+def _load_tasks():
+    if not TASK_FILE.exists():
+        return
+    try:
+        with TASK_FILE.open("r", encoding="utf-8") as f:
+            items = json.load(f)
+        with _task_lock:
+            for t in items:
+                rid = t.get("request_id")
+                if rid:
+                    _tasks[rid] = t
+        print(f"[server] loaded {len(_tasks)} tasks from {TASK_FILE}")
+    except Exception as e:
+        print(f"[server] load tasks failed: {e}")
+
+
+def _refresh_task_status(task: dict) -> dict:
+    """按时间动态刷新任务状态(超时判定)。调用方需持有 _task_lock。"""
+    if task["status"] in ("pending", "received"):
+        age = int(time.time() * 1000) - task["created_at_ms"]
+        if age > TASK_TIMEOUT_MS:
+            task["status"] = "timeout"
+            task["timeout_at_ms"] = int(time.time() * 1000)
+    return task
 
 
 def _load_existing():
@@ -56,6 +103,18 @@ def _append_to_disk(record: dict):
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
+@app.after_request
+def _no_cache_static(resp):
+    """开发阶段:静态资源禁用缓存。
+
+    否则改完 JS/CSS 后页面仍用旧文件(必须 Ctrl+F5 才生效),
+    表现为"改了配置但刷新频率/点数没变"。
+    """
+    if request.path.startswith("/static"):
+        resp.headers["Cache-Control"] = "no-store, must-revalidate"
+    return resp
+
+
 @app.get("/")
 def index():
     return render_template("index.html")
@@ -63,7 +122,10 @@ def index():
 
 @app.post("/api/data")
 def receive_data():
-    """板端 / 模拟器把 JSON POST 过来。"""
+    """板端 / 模拟器把 JSON POST 过来。
+
+    若带 request_id,说明是响应某个采集任务,会顺带把任务标记为 completed。
+    """
     if not request.is_json:
         return jsonify({"ok": False, "error": "Content-Type must be application/json"}), 400
     try:
@@ -88,6 +150,23 @@ def receive_data():
             _append_to_disk(record)
         except Exception as e:
             print(f"[server] persist failed: {e}")
+
+    # ---- 如果这条数据是某个采集任务的响应,标记任务完成 ----
+    req_id = data.get("request_id")
+    if req_id:
+        matched = False
+        with _task_lock:
+            task = _tasks.get(str(req_id))
+            if task:
+                task["status"] = "completed"
+                task["completed_at_ms"] = record["received_at_ms"]
+                task["elapsed_ms"] = record["received_at_ms"] - task["created_at_ms"]
+                task["record_index"] = len(_records) - 1
+                matched = True
+        # 注意:持久化必须放在锁块之外,避免与 _persist_tasks 内部的加锁冲突
+        if matched:
+            _persist_tasks()
+            print(f"[task] {req_id} completed in {task['elapsed_ms']} ms")
 
     return jsonify({"ok": True, "count": len(_records)})
 
@@ -364,7 +443,187 @@ def health():
     return jsonify({"ok": True, "time_ms": int(time.time() * 1000), "count": len(_records)})
 
 
+# ============================================================
+#  第 2 周:Web 远程采集指令与执行结果反馈
+#  流程:Web 创建任务 → 板端拉命令 → 板端采集并回执 → 状态完成/超时
+# ============================================================
+
+@app.post("/api/task")
+def create_task():
+    """Web 端创建一次采集任务。
+
+    body: {"group_id": "G03", "device_id": "esp32s3-eye-01", "action": "sample"}
+    返回 request_id,前端据此追踪本次采集结果。
+    """
+    if not request.is_json:
+        return jsonify({"ok": False, "error": "Content-Type must be application/json"}), 400
+    try:
+        body = request.get_json(force=True, silent=True) or {}
+    except Exception:
+        body = {}
+
+    group_id = str(body.get("group_id", "")).strip()
+    device_id = str(body.get("device_id", "")).strip()
+    action = str(body.get("action", "sample")).strip() or "sample"
+
+    if not group_id:
+        return jsonify({"ok": False, "error": "group_id is required"}), 400
+    if not device_id:
+        # 没指定设备就取该组最近上报的设备
+        with _lock:
+            for r in reversed(_records):
+                if r.get("group_id") == group_id:
+                    device_id = str(r.get("device_id", ""))
+                    break
+    if not device_id:
+        return jsonify({"ok": False, "error": "device_id is required (且该组暂无历史数据可推断)"}), 400
+
+    now = int(time.time() * 1000)
+    request_id = f"req-{now}-{uuid.uuid4().hex[:6]}"
+    task = {
+        "request_id": request_id,
+        "group_id": group_id,
+        "device_id": device_id,
+        "action": action,
+        "status": "pending",        # pending → received → completed / failed / timeout
+        "created_at_ms": now,
+        "dispatched_at_ms": None,   # 板端拉走命令的时间
+        "received_at_ms": None,     # 板端回执"已接收"
+        "completed_at_ms": None,
+        "elapsed_ms": None,
+        "record_index": None,       # 对应 data.json 里的记录序号
+        "note": "",
+    }
+    with _task_lock:
+        _tasks[request_id] = task
+        # 清理过旧的任务,避免无限增长
+        if len(_tasks) > MAX_TASKS:
+            for rid in sorted(_tasks, key=lambda k: _tasks[k]["created_at_ms"])[:len(_tasks) - MAX_TASKS]:
+                _tasks.pop(rid, None)
+    _persist_tasks()
+
+    print(f"[task] created {request_id} for {device_id} (group={group_id}, action={action})")
+    return jsonify({"ok": True, "task": task})
+
+
+@app.get("/api/command")
+def get_command():
+    """板端轮询:拉取属于自己的待执行任务。
+
+    query: device_id
+    返回 command=null 表示暂无任务;有任务时同时把状态置为 received。
+    """
+    device_id = request.args.get("device_id", "").strip()
+    if not device_id:
+        return jsonify({"ok": False, "error": "device_id is required"}), 400
+
+    now = int(time.time() * 1000)
+    picked = None
+    with _task_lock:
+        # 先刷新所有任务状态(把超时的挑出来)
+        for t in _tasks.values():
+            _refresh_task_status(t)
+        # 取该设备最早的一个待执行任务
+        candidates = [
+            t for t in _tasks.values()
+            if t["device_id"] == device_id and t["status"] == "pending"
+        ]
+        if candidates:
+            picked = min(candidates, key=lambda t: t["created_at_ms"])
+            picked["status"] = "received"
+            picked["dispatched_at_ms"] = now
+    if picked:
+        _persist_tasks()
+        print(f"[task] {picked['request_id']} dispatched to {device_id}")
+
+    return jsonify({
+        "ok": True,
+        "command": (
+            {"request_id": picked["request_id"], "action": picked["action"]}
+            if picked else None
+        ),
+    })
+
+
+@app.post("/api/ack")
+def ack_task():
+    """板端回执。
+
+    body: {"request_id": "...", "device_id": "...", "stage": "received"|"started"|"failed", "note": "..."}
+    """
+    if not request.is_json:
+        return jsonify({"ok": False, "error": "Content-Type must be application/json"}), 400
+    body = request.get_json(force=True, silent=True) or {}
+    request_id = str(body.get("request_id", "")).strip()
+    stage = str(body.get("stage", "received")).strip()
+    note = str(body.get("note", "")).strip()
+
+    if not request_id:
+        return jsonify({"ok": False, "error": "request_id is required"}), 400
+
+    now = int(time.time() * 1000)
+    with _task_lock:
+        task = _tasks.get(request_id)
+        if not task:
+            return jsonify({"ok": False, "error": "unknown request_id"}), 404
+        if stage == "failed":
+            task["status"] = "failed"
+            task["completed_at_ms"] = now
+            task["elapsed_ms"] = now - task["created_at_ms"]
+        elif stage == "completed":
+            # 不需要采集数据的命令(pause/resume 等)由板端直接回 completed
+            task["status"] = "completed"
+            task["received_at_ms"] = task["received_at_ms"] or now
+            task["completed_at_ms"] = now
+            task["elapsed_ms"] = now - task["created_at_ms"]
+        else:
+            task["received_at_ms"] = task["received_at_ms"] or now
+            if task["status"] == "pending":
+                task["status"] = "received"
+        if note:
+            task["note"] = note
+    _persist_tasks()
+    print(f"[task] {request_id} ack: {stage}")
+    return jsonify({"ok": True, "task": task})
+
+
+@app.get("/api/task/<request_id>")
+def get_task(request_id: str):
+    """查询单个任务状态(前端轮询用)。"""
+    with _task_lock:
+        task = _tasks.get(request_id)
+        if not task:
+            return jsonify({"ok": False, "error": "unknown request_id"}), 404
+        _refresh_task_status(task)
+        snapshot = dict(task)
+    return jsonify({"ok": True, "task": snapshot})
+
+
+@app.get("/api/tasks")
+def list_tasks():
+    """任务列表(默认最近 20 条)。"""
+    group_id = request.args.get("group_id", "").strip()
+    device_id = request.args.get("device_id", "").strip()
+    try:
+        limit = int(request.args.get("limit", 20))
+    except ValueError:
+        limit = 20
+    limit = max(1, min(limit, 100))
+
+    with _task_lock:
+        for t in _tasks.values():
+            _refresh_task_status(t)
+        items = [
+            dict(t) for t in _tasks.values()
+            if (not group_id or t["group_id"] == group_id)
+            and (not device_id or t["device_id"] == device_id)
+        ]
+    items.sort(key=lambda t: t["created_at_ms"], reverse=True)
+    return jsonify({"ok": True, "tasks": items[:limit], "count": len(items)})
+
+
 if __name__ == "__main__":
     _load_existing()
+    _load_tasks()
     # 0.0.0.0 让板子能通过局域网 IP 访问
     app.run(host="0.0.0.0", port=8000, debug=False, threaded=True)

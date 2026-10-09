@@ -21,6 +21,9 @@
     serverCount: 0,
     apiFailStreak: 0,
     recvTimes: [],          // 用于估算实际接收频率
+    currentTask: null,      // 当前追踪的远程采集任务
+    taskPollTimer: null,    // 任务状态轮询定时器
+    devicePaused: false,    // 板端周期上报是否处于暂停(由 pause/resume 任务结果推断)
   };
 
   // ---------- 状态指示 ----------
@@ -325,7 +328,8 @@
     // 并发请求:最新 + 历史 + 统计
     const [latestResp, historyResp, statsResp] = await Promise.all([
       Api.latest(g),
-      Api.history(g, { sinceMs, limit: 500 }),
+      // 历史点数跟随图表配置(默认 800),数据变密后窗口不至于被 limit 截断
+      Api.history(g, { sinceMs, limit: CONFIG.chart.historyMaxPoints }),
       Api.stats(g, { sinceMs }),
     ]);
 
@@ -388,9 +392,18 @@
     updateQuality(statsResp);
 
     // ---- 图表 ----
+    // ---- 历史图:按 historyRefreshMs 节流(默认 1s)----
+    // 实时曲线跟数据走,历史是分析视图,刷新太勤整条线会一直平移、看着发跳。
+    // 切换时间范围时 force=true,立即重画。
     if (historyResp.ok && historyResp.records) {
       state.lastRecords = historyResp.records;
-      Charts.renderHistory(historyResp.records);
+      const due = force ||
+        !state.lastHistoryDrawMs ||
+        (now - state.lastHistoryDrawMs >= (CONFIG.chart.historyRefreshMs || 1000));
+      if (due) {
+        state.lastHistoryDrawMs = now;
+        Charts.renderHistory(historyResp.records);
+      }
     }
     // 实时图:只在新数据到来时追加
     if (!state.lastRecord || state.lastRecord.received_at_ms !== rec.received_at_ms) {
@@ -422,6 +435,7 @@
         Charts.clear();
         state.lastRecord = null;
         state.recvTimes = [];
+        loadTaskHistory();   // 切换分组后,任务列表跟着切换
         refresh(true);
       }, 400);
       gInput.addEventListener("input", apply);
@@ -529,10 +543,159 @@
       if (cb) cb.addEventListener("change", () => Charts.toggleHistorySeries(idx, cb.checked));
     });
 
+    // 远程采集任务(第 2 周)
+    $("taskSampleBtn")?.addEventListener("click", () => sendTask("sample"));
+    $("taskPauseBtn")?.addEventListener("click", () => sendTask("pause"));
+    $("taskResumeBtn")?.addEventListener("click", () => sendTask("resume"));
+    $("taskRefreshBtn")?.addEventListener("click", () => {
+      loadTaskHistory();
+      toast("已刷新任务列表");
+    });
+
     // 页面可见性:切回前台立即刷新
     document.addEventListener("visibilitychange", () => {
       if (!document.hidden && !state.paused) refresh(true);
     });
+  }
+
+  // ---------- 远程采集任务(第 2 周) ----------
+  const TASK_ACTION_TEXT = { sample: "采集一次", pause: "暂停周期上报", resume: "恢复周期上报" };
+  const TASK_STATUS_TEXT = {
+    pending: "待领取", received: "设备已领取", completed: "已完成",
+    failed: "失败", timeout: "超时",
+  };
+
+  function esc(s) {
+    return String(s).replace(/[&<>"']/g, (c) =>
+      ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+  }
+
+  function taskStatusBadge(status) {
+    const cls = { pending: "pending", received: "received", completed: "completed",
+                  failed: "failed", timeout: "timeout" }[status] || "pending";
+    return `<span class="badge ${cls}">${TASK_STATUS_TEXT[status] || esc(status)}</span>`;
+  }
+
+  /** 任务状态流转图:已提交 → 设备已领取 → 完成(失败/超时用红色终点) */
+  function taskFlowHtml(status) {
+    const steps = [
+      { key: "pending", label: "已提交" },
+      { key: "received", label: "设备已领取" },
+      { key: "completed", label: status === "failed" ? "失败" : status === "timeout" ? "超时" : "完成" },
+    ];
+    const order = ["pending", "received", "completed", "failed", "timeout"];
+    const cur = Math.max(0, order.indexOf(status));
+    return steps.map((s, i) => {
+      const reached = i <= cur;
+      const isEnd = i === steps.length - 1;
+      const bad = isEnd && (status === "failed" || status === "timeout");
+      return `<span class="task-step ${reached ? "on" : ""} ${bad ? "bad" : ""}">${s.label}</span>` +
+             (i < steps.length - 1 ? '<span class="task-arrow">→</span>' : "");
+    }).join("");
+  }
+
+  function renderTaskCurrent(task, noticeText) {
+    const box = $("taskCurrent");
+    if (!box) return;
+    if (!task) {
+      box.innerHTML = '<div class="muted">尚无进行中的任务。点击"采集一次"发起远程采集,或在暂停周期上报后验证命令通道仍可用。</div>';
+      return;
+    }
+    const elapsed = task.elapsed_ms !== null && task.elapsed_ms !== undefined
+      ? task.elapsed_ms + " ms"
+      : (task.status === "pending" || task.status === "received" ? "等待中…" : "--");
+    box.innerHTML = `
+      <div class="task-current-row">
+        <span class="task-label">当前任务</span>
+        ${taskStatusBadge(task.status)}
+        <b>${esc(TASK_ACTION_TEXT[task.action] || task.action)}</b>
+        <span class="task-rid" title="request_id">${esc(task.request_id)}</span>
+      </div>
+      <div class="task-flow">${taskFlowHtml(task.status)}</div>
+      <div class="task-current-note">
+        耗时:${esc(elapsed)}${task.note ? " · " + esc(task.note) : ""}${noticeText ? " · " + noticeText : ""}
+      </div>`;
+  }
+
+  /** 轮询任务状态,直到终态或前端等待超时 */
+  function pollTask(requestId) {
+    if (state.taskPollTimer) clearInterval(state.taskPollTimer);
+    const startedAt = nowMs();
+    let frontEndTimeoutNoted = false;
+    state.taskPollTimer = setInterval(async () => {
+      const resp = await Api.getTask(requestId);
+      if (resp.ok && resp.task) {
+        state.currentTask = resp.task;
+        renderTaskCurrent(resp.task);
+        const st = resp.task.status;
+        if (st === "completed" || st === "failed" || st === "timeout") {
+          clearInterval(state.taskPollTimer);
+          state.taskPollTimer = null;
+          // pause/resume 结果反映设备状态
+          if (st === "completed" && resp.task.action === "pause") { state.devicePaused = true; }
+          if (st === "completed" && resp.task.action === "resume") { state.devicePaused = false; }
+          loadTaskHistory();
+          if (st === "completed") {
+            toast(`任务完成(${resp.task.elapsed_ms} ms)`);
+            if (resp.task.action === "sample") refresh(true); // 采集完成立即拉新数据
+          } else if (st === "timeout") {
+            toast("任务超时:设备未响应");
+          } else {
+            toast("任务失败:" + (resp.task.note || "设备报告失败"));
+          }
+          return;
+        }
+      }
+      // 前端等待上限:不再轮询,但不改任务状态(以服务器判定为准)
+      if (!frontEndTimeoutNoted && nowMs() - startedAt > CONFIG.task.pollTimeoutMs) {
+        frontEndTimeoutNoted = true;
+        clearInterval(state.taskPollTimer);
+        state.taskPollTimer = null;
+        renderTaskCurrent(state.currentTask,
+          "设备长时间未领取或未完成,请检查设备是否在线。任务仍在服务器跟踪,历史数据不会被误标为本次结果。");
+        loadTaskHistory();
+        toast("等待设备响应超时");
+      }
+    }, CONFIG.task.pollIntervalMs);
+  }
+
+  /** 发起远程任务 */
+  async function sendTask(action) {
+    const btns = ["taskSampleBtn", "taskPauseBtn", "taskResumeBtn"].map($);
+    btns.forEach((b) => { if (b) b.disabled = true; });
+    const resp = await Api.createTask(state.groupId, action);
+    btns.forEach((b) => { if (b) b.disabled = false; });
+    if (!resp.ok || !resp.task) {
+      toast("创建任务失败:" + (resp.error || "未知错误"));
+      renderTaskCurrent(state.currentTask, "创建失败:" + (resp.error || "未知错误"));
+      return;
+    }
+    state.currentTask = resp.task;
+    renderTaskCurrent(resp.task);
+    toast(`任务已提交:${TASK_ACTION_TEXT[action]}`);
+    pollTask(resp.task.request_id);
+    loadTaskHistory();
+  }
+
+  /** 最近任务列表 */
+  async function loadTaskHistory() {
+    const resp = await Api.tasks(state.groupId, { limit: CONFIG.task.historyLimit });
+    const tbody = document.querySelector("#taskHistoryTable tbody");
+    if (!tbody) return;
+    if (!resp.ok || !resp.tasks || !resp.tasks.length) {
+      tbody.innerHTML = '<tr><td colspan="5" class="muted">暂无任务记录</td></tr>';
+      return;
+    }
+    tbody.innerHTML = resp.tasks.map((t) => {
+      const elapsed = t.elapsed_ms !== null && t.elapsed_ms !== undefined ? t.elapsed_ms + " ms" : "--";
+      return `<tr>
+        <td>${fmtDateTime(t.created_at_ms)}</td>
+        <td>${esc(TASK_ACTION_TEXT[t.action] || t.action)}</td>
+        <td>${taskStatusBadge(t.status)}</td>
+        <td class="task-rid">${esc(t.request_id)}</td>
+        <td>${esc(elapsed)}</td>
+      </tr>`;
+    }).join("");
   }
 
   // ---------- 轻量提示 ----------
@@ -563,6 +726,7 @@
     setSystemStatus("idle", "正在连接…");
     setBanner("info", "正在连接数据服务…");
     refresh(true).then(() => restartTimer());
+    loadTaskHistory();   // 初始加载最近任务
 
     // 姿态图随最新数据更新
     setInterval(() => {
