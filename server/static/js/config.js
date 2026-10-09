@@ -15,6 +15,10 @@ const CONFIG = {
     taskCreate: "/api/task",      // POST 创建任务
     taskGet: "/api/task",         // GET /api/task/<id> 查询状态
     taskList: "/api/tasks",       // GET /api/tasks 任务列表
+    // 第 3 周:按键触发事件
+    eventList: "/api/events",     // GET 事件列表(只含服务端真正收到过的)
+    eventAck: "/api/event",       // POST /api/event/<id>/ack   回应
+    eventCancel: "/api/event",    // POST /api/event/<id>/cancel 取消
   },
 
   // ---------- 远程采集任务 ----------

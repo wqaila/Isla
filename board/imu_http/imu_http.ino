@@ -15,6 +15,34 @@
 #endif
 #include <ArduinoJson.h>
 
+// ---------- 第 3 周:板载 LCD(ST7789)+ BOOT 按键 ----------
+#if ENABLE_WEEK3
+  #include <SPI.h>
+  #include <Adafruit_GFX.h>
+  #include <Adafruit_ST7789.h>
+
+  // ESP32-S3-EYE 官方 BSP 引脚(LCD 用 SPI3)
+  #define LCD_SCLK   21
+  #define LCD_MOSI   47
+  #define LCD_DC     43
+  #define LCD_CS     44
+  #define LCD_BL     48
+  #define LCD_RST    -1        // 未连接,用软件复位
+  #define KEY_BOOT   0         // 板载 BOOT 键,按下为低电平
+
+  // ⚠️ 背光极性:S3-EYE 背光由 AO3401A(P 沟道 MOS)驱动,
+  // 栅极经电阻接 GPIO48 → **低电平导通点亮**,与直觉相反。
+  #define BL_ON()   digitalWrite(LCD_BL, LOW)
+  #define BL_OFF()  digitalWrite(LCD_BL, HIGH)
+
+  // 该版本 GFX 库没有 CLR_NAVY / CLR_DKGREY,用 color565 自己配
+  #define CLR_NAVY    tft.color565(0, 0, 128)
+  #define CLR_DKGREY  tft.color565(90, 90, 90)
+
+  Adafruit_ST7789 tft = Adafruit_ST7789(&SPI, LCD_CS, LCD_DC, LCD_RST);
+  bool lcd_ok = false;
+#endif
+
 // ---------- QMA7981 定义 ----------
 static const uint8_t QMA_ADDR    = 0x12;   // 7 位 I2C 地址
 static const int     I2C_SDA     = 4;      // S3-EYE 板载 I2C
@@ -39,6 +67,43 @@ static const unsigned long UPLOAD_PERIOD_MS = 200;  // 200ms 上传一次(5Hz),�
 unsigned long last_sample_ms = 0;
 unsigned long last_upload_ms = 0;
 unsigned long http_fail_count = 0;
+// ---- 与服务端对表 ----
+// 板子没有 RTC,millis() 只是上电毫秒数,不能直接当时间戳。
+// 每次轮询 /api/command 都会拿到 server_time_ms,据此算出偏移量,
+// 把本地事件时刻换算成与服务端可比的墙上时钟。
+// ⚠️ 必须是 64 位:墙上时钟毫秒数约 1.79e12,ESP32 的 long 只有 32 位
+// (最大 21 亿),用 long 会直接溢出,导致时间戳变成荒谬值。
+long long time_offset_ms = 0;
+bool time_synced   = false;
+
+#if ENABLE_WEEK3
+// ---------- 第 3 周:触发事件状态(本地视角) ----------
+// 关键设计:本地确认 与 远端收到 是两件独立的事,必须分开证明。
+//   EV_LOCAL   = 按键已按下,本地屏幕已确认(但还没送到服务端)
+//   EV_SENT    = 服务端确实收到了(有 event_id 回执)
+//   EV_ACKED   = 远端回应了
+// 断网时停在 EV_LOCAL,绝不能显示"对方已收到"。
+enum EvState { EV_IDLE, EV_LOCAL, EV_SENT, EV_ACKED, EV_CANCELLED };
+static const char *EV_TEXT[] = { "待触发", "本地已确认", "已送达", "对方已回应", "已取消" };
+EvState      ev_state     = EV_IDLE;
+char         ev_id[40]    = "";
+unsigned long ev_state_ms = 0;      // 进入当前状态的时刻
+unsigned long long ev_local_wall_ms = 0; // 本地确认时刻(已换算成墙上时钟,64 位)
+unsigned long ev_poll_ms  = 0;      // 上次轮询服务端回应
+unsigned long ev_lcd_ms   = 0;      // 上次刷新屏幕
+unsigned long ev_seq      = 0;      // 本地事件序号
+bool         ev_delivered = false;  // 服务端是否真的收到过
+unsigned long ev_key_ms   = 0;      // 按键去抖
+bool         ev_key_last  = true;
+// 中断方式检测按键:主循环里穿插着 HTTP 上传与 SPI 刷屏,
+// 纯轮询可能漏掉短暂按键,所以用 FALLING 中断置位 + 主循环去抖。
+volatile bool          ev_key_flag    = false;
+volatile unsigned long ev_key_isr_ms  = 0;
+volatile int           ev_key_isr_cnt = 0;   // 中断次数(含抖动,用于诊断)
+volatile int           ev_poll_low_cnt = 0;  // 轮询读到低电平的次数(兜底诊断)
+void IRAM_ATTR on_boot_key_isr();            // 前置声明(lcd_init 里要用)
+unsigned long ev_blink_until_ms = 0;         // 触发后背光闪烁截止时刻
+#endif
 
 // 1s 内均值缓存(单位:g)
 struct SumBuf {
@@ -316,6 +381,20 @@ static void poll_command() {
   DeserializationError err = deserializeJson(doc, payload);
   if (err) return;
 
+  // ---- 与服务端对表(板子没有 RTC,靠这个把 millis() 换算成墙上时钟) ----
+  // 这样"本地确认时刻"才能和"服务端收到时刻"做真实对比,证明两者是分离的。
+  if (doc.containsKey("server_time_ms")) {
+    long long st = doc["server_time_ms"].as<long long>();
+    // 取响应到达时刻的 millis(),补偿掉 HTTP 往返,误差只剩单程
+    long long off = st - (long long)millis();
+    if (!time_synced) {
+      Serial.printf("[SYNC] 首次对表 server=%lld millis=%lu offset=%lld\n",
+                    st, millis(), off);
+    }
+    time_offset_ms = off;
+    time_synced = true;
+  }
+
   JsonObject cmd = doc["command"];
   if (cmd.isNull()) return;
 
@@ -341,6 +420,218 @@ static void poll_command() {
 }
 
 // ============================================================
+// ============================================================
+//  第 3 周:本地反馈(LCD)+ 按键触发 + 事件上报
+// ============================================================
+#if ENABLE_WEEK3
+
+/** LCD 初始化。失败也不影响 IMU 采集(lcd_ok=false 时跳过所有绘制)。 */
+void lcd_init() {
+  pinMode(LCD_BL, OUTPUT);
+  BL_ON();                                  // P-MOS 低电平点亮
+  pinMode(KEY_BOOT, INPUT_PULLUP);
+  // 按键改中断检测(FALLING = 按下接地的瞬间)
+  attachInterrupt(digitalPinToInterrupt(KEY_BOOT), on_boot_key_isr, FALLING);
+  SPI.begin(LCD_SCLK, -1, LCD_MOSI);        // SCLK, MISO(不用), MOSI
+  tft.init(240, 240);
+  tft.setRotation(0);
+  tft.fillScreen(ST77XX_BLACK);
+  lcd_ok = true;
+  Serial.println("[LCD] init done (SCLK21 MOSI47 DC43 CS44 BL48)");
+}
+
+/** 画一屏:上半部分放 IMU 实时值,下半部分放事件状态。 */
+void lcd_draw(float ax, float ay, float az) {
+  if (!lcd_ok) return;
+  tft.fillScreen(ST77XX_BLACK);
+
+  // ---- 顶部:设备标识 ----
+  tft.fillRect(0, 0, 240, 22, CLR_NAVY);
+  tft.setTextSize(1);
+  tft.setTextColor(ST77XX_WHITE);
+  tft.setCursor(6, 7);
+  tft.print(DEVICE_ID);
+
+  // ---- 中部:三轴实时值 ----
+  tft.setTextSize(2);
+  tft.setTextColor(ST77XX_RED);
+  tft.setCursor(8, 34);
+  tft.print("X "); tft.print(ax, 2);
+  tft.setTextColor(ST77XX_GREEN);
+  tft.setCursor(8, 58);
+  tft.print("Y "); tft.print(ay, 2);
+  tft.setTextColor(ST77XX_BLUE);
+  tft.setCursor(8, 82);
+  tft.print("Z "); tft.print(az, 2);
+
+  tft.setTextSize(1);
+  tft.setTextColor(CLR_DKGREY);
+  tft.setCursor(8, 106);
+  tft.print("unit: g");
+
+  // ---- 分隔线 ----
+  tft.drawFastHLine(0, 122, 240, CLR_DKGREY);
+
+  // ---- 下部:事件状态(核心:区分本地/远端证据) ----
+  // 用整块填充色 + 大号反白文字,保证状态变化一眼可见
+  uint16_t color;
+  switch (ev_state) {
+    case EV_LOCAL:     color = ST77XX_YELLOW; break;  // 只有本地证据
+    case EV_SENT:      color = ST77XX_CYAN;   break;  // 已送达,等回应
+    case EV_ACKED:     color = ST77XX_GREEN;  break;  // 远端已回应
+    case EV_CANCELLED: color = ST77XX_RED;    break;
+    default:           color = CLR_NAVY;              // 空闲:深蓝底
+  }
+  // 触发后 1.5 秒内,状态块在本色与白色之间闪动,强化"我确实收到了这一按"。
+  // ⚠️ 不要靠关背光来闪:那样整屏变黑,看起来像死机。
+  unsigned long _ms = millis();
+  bool flash = (_ms < ev_blink_until_ms) && ((_ms / 150) % 2 == 0);
+  tft.fillRect(0, 128, 240, 112, flash ? ST77XX_WHITE : color);
+  // 只有本地证据(未送达)时加红边框,持续可见,不靠闪烁
+  if (ev_state == EV_LOCAL && !ev_delivered) {
+    tft.drawRect(1, 129, 238, 110, ST77XX_RED);
+    tft.drawRect(2, 130, 236, 108, ST77XX_RED);
+  }
+
+  tft.setTextSize(1);
+  tft.setTextColor(ST77XX_BLACK);
+  tft.setCursor(8, 134);
+  tft.print("EVENT STATE");
+
+  tft.setTextSize(2);
+  tft.setTextColor(ST77XX_BLACK);
+  tft.setCursor(8, 148);
+  tft.print(EV_TEXT[ev_state]);
+
+  // 证据说明:明确区分"本地"与"远端"
+  tft.setTextSize(1);
+  tft.setTextColor(ST77XX_BLACK);
+  tft.setCursor(8, 176);
+  if (ev_state == EV_LOCAL) {
+    tft.print("Local confirmed,");
+    tft.setCursor(8, 188);
+    tft.print("NOT delivered");     // 断网/未送达:绝不显示"对方已收到"
+  } else if (ev_state == EV_SENT) {
+    tft.print("Delivered,");
+    tft.setCursor(8, 188);
+    tft.print("waiting reply");
+  } else if (ev_state == EV_ACKED) {
+    tft.print("Delivered,");
+    tft.setCursor(8, 188);
+    tft.print("remote acked");
+  } else if (ev_state == EV_CANCELLED) {
+    tft.print("cancelled by peer");
+  } else {
+    tft.setCursor(8, 176);
+    tft.print("press BOOT to trigger");
+  }
+
+  // ---- 底部:event_id 与按下次数 ----
+  tft.setTextSize(1);
+  tft.setTextColor(ST77XX_BLACK);
+  tft.setCursor(8, 208);
+  tft.print("key: ");
+  tft.print(ev_seq);
+  tft.setCursor(8, 222);
+  if (ev_id[0]) tft.print(ev_id);
+}
+
+/** 上报一次本地触发。成功才算"远端收到"。 */
+void send_event() {
+  if (WiFi.status() != WL_CONNECTED) {
+    // 断网:本地已经确认过了,但绝不声称送达
+    Serial.println("[EV] offline, stay LOCAL (not delivered)");
+    return;
+  }
+  HTTPClient http;
+  http.setConnectTimeout(2000);
+  http.setTimeout(2500);
+  char url[128];
+  snprintf(url, sizeof(url), "http://%s:%d/api/event", SERVER_HOST, SERVER_PORT);
+  if (!http.begin(url)) return;
+
+  http.addHeader("Content-Type", "application/json");
+  StaticJsonDocument<256> doc;
+  doc["event_id"] = ev_id;
+  doc["group_id"] = GROUP_ID;
+  doc["device_id"] = DEVICE_ID;
+  doc["type"] = "button_press";
+  // 本地确认时刻(墙上时钟);未与服务端对表时为 0,避免算出荒谬的延迟
+  doc["local_confirmed_at_ms"] = ev_local_wall_ms;
+  doc["local_uptime_ms"]       = ev_state_ms;   // 兜底:上电毫秒数,始终有效
+  String body;
+  serializeJson(doc, body);
+
+  int code = http.POST(body);
+  http.end();
+  if (code == 200) {
+    ev_delivered = true;
+    ev_state = EV_SENT;
+    Serial.printf("[EV] delivered %s\n", ev_id);
+  } else {
+    // 上报失败:保持"本地已确认",不冒充送达
+    Serial.printf("[EV] post failed code=%d, stay LOCAL\n", code);
+  }
+}
+
+/** 轮询服务端有没有回应/取消。 */
+void poll_event_updates() {
+  if (WiFi.status() != WL_CONNECTED) return;
+  HTTPClient http;
+  http.setConnectTimeout(1500);
+  http.setTimeout(2000);
+  char url[160];
+  snprintf(url, sizeof(url), "http://%s:%d/api/event/pending?device_id=%s",
+           SERVER_HOST, SERVER_PORT, DEVICE_ID);
+  if (!http.begin(url)) return;
+  int code = http.GET();
+  if (code == 200) {
+    String resp = http.getString();
+    StaticJsonDocument<512> doc;
+    if (!deserializeJson(doc, resp)) {
+      JsonArray arr = doc["updates"].as<JsonArray>();
+      for (JsonObject u : arr) {
+        const char *eid = u["event_id"];
+        const char *act = u["action"];
+        if (!eid || !act) continue;
+        if (strcmp(eid, ev_id) != 0) continue;      // 只处理当前事件
+        if (strcmp(act, "ack") == 0) {
+          ev_state = EV_ACKED;
+          Serial.println("[EV] remote acked");
+        } else if (strcmp(act, "cancel") == 0) {
+          ev_state = EV_CANCELLED;
+          Serial.println("[EV] cancelled by peer");
+        }
+      }
+    }
+  }
+  http.end();
+}
+
+/** BOOT 键按下中断(只置位,不做耗时操作)。 */
+void IRAM_ATTR on_boot_key_isr() {
+  ev_key_flag   = true;
+  ev_key_isr_ms = millis();
+  ev_key_isr_cnt++;
+}
+
+/** 按键按下:先本地确认,再尝试上报。 */
+void on_key_press() {
+  ev_seq++;
+  snprintf(ev_id, sizeof(ev_id), "%s-%lu-%lu", DEVICE_ID, millis(), ev_seq);
+  ev_state_ms = millis();
+  // 换算成墙上时钟(与服务端可比);未对表时为 0,服务端不会拿它算延迟
+  ev_local_wall_ms = time_synced ? (unsigned long long)((long long)ev_state_ms + time_offset_ms) : 0;
+  ev_delivered = false;
+  ev_state = EV_LOCAL;                 // ← 本地立即确认,与是否送达无关
+  ev_blink_until_ms = millis() + 1500; // 背光闪 1.5 秒,本地反馈一定看得见
+  Serial.printf("[EV] key pressed, local confirmed: %s\n", ev_id);
+  send_event();                        // 成功才会推进到 EV_SENT
+}
+
+#endif  // ENABLE_WEEK3
+
+
 void setup() {
   Serial.begin(115200);
   // ⚠️ 关键:S3-EYE 是原生 USB CDC。主机没打开串口监视器时,
@@ -363,6 +654,11 @@ void setup() {
   }
 #else
   Serial.println("[QMA] demo mode (USE_QMA7981=0), using synthetic data");
+#endif
+
+#if ENABLE_WEEK3
+  lcd_init();
+  Serial.println("[WK3] press BOOT key to trigger event");
 #endif
 }
 
@@ -404,6 +700,52 @@ void loop() {
     last_cmd_poll_ms = now;
     if (WiFi.status() == WL_CONNECTED) poll_command();
   }
+
+#if ENABLE_WEEK3
+  // ---- 第 3 周:按键检测(中断置位 + 轮询兜底 + 去抖) ----
+  // 主循环里 HTTP 上传实测要 150~350ms,纯轮询会漏掉短按键,
+  // 所以两条路都走:中断标志 或 轮询读到低电平,任一命中即触发。
+  bool key_low = (digitalRead(KEY_BOOT) == LOW);
+  if (key_low) ev_poll_low_cnt++;
+  // 兜底路径也要判断"下降沿",否则按住不放会每 300ms 重复触发一次
+  bool falling = key_low && !ev_key_last;
+  if ((ev_key_flag || falling) && (now - ev_key_ms > 300)) {   // 300ms 去抖
+    ev_key_ms = now;
+    ev_key_flag = false;
+    on_key_press();
+  } else if (ev_key_flag) {
+    ev_key_flag = false;                     // 抖动,丢弃
+  }
+  ev_key_last = key_low;
+
+  // ---- 诊断心跳:2s 一行,确认按键通道与主循环都活着 ----
+  {
+    static unsigned long last_dbg = 0;
+    if (now - last_dbg >= 2000) {
+      last_dbg = now;
+      Serial.printf("[DBG] IO0=%d isr=%d poll_low=%d key=%d state=%s(%d) up=%lus\n",
+                    digitalRead(KEY_BOOT), ev_key_isr_cnt, ev_poll_low_cnt, ev_seq,
+                    EV_TEXT[ev_state], (int)ev_state, now / 1000);
+    }
+  }
+
+  // ---- 第 3 周:轮询远端回应/取消(1s) ----
+  if ((ev_state == EV_SENT) && (now - ev_poll_ms >= 1000)) {
+    ev_poll_ms = now;
+    poll_event_updates();
+  }
+
+  // ---- 第 3 周:屏幕刷新(2Hz,避免 SPI 占用太多主循环时间) ----
+  if (now - ev_lcd_ms >= 500) {
+    ev_lcd_ms = now;
+    lcd_draw(sumbuf.n > 0 ? (float)(sumbuf.ax / sumbuf.n) : 0.0f,
+             sumbuf.n > 0 ? (float)(sumbuf.ay / sumbuf.n) : 0.0f,
+             sumbuf.n > 0 ? (float)(sumbuf.az / sumbuf.n) : 0.0f);
+    // 本地反馈靠"状态块闪动"(见 lcd_draw),背光始终常亮:
+    // 关背光会让整屏变黑,看起来像故障,不要那么做。
+    BL_ON();
+  }
+#endif
 
   // ---- WiFi 掉线重连 ----
   static unsigned long last_wifi_check = 0;

@@ -150,6 +150,34 @@
       </div>
     </section>
 
+    <!-- ========== 按键触发事件(第 3 周) ========== -->
+    <section class="card" id="eventCard">
+      <div class="card-head">
+        <h2>按键触发事件</h2>
+        <div class="card-actions">
+          <button id="eventRefreshBtn" class="btn small" type="button">刷新列表</button>
+        </div>
+      </div>
+      <div class="table-scroll">
+        <table class="stats" id="eventTable">
+          <thead>
+            <tr>
+              <th>本地确认</th><th>到达服务端</th><th>状态</th><th>event_id</th><th>操作</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr><td colspan="5" class="muted">暂无事件。按下板子上的 BOOT 键试一次。</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="hint">
+        <b>本地确认 ≠ 远端收到</b>:板端按下按键会<b>立即在屏幕上给出本地反馈</b>,这是本地证据;
+        只有事件成功 POST 到服务端,才会出现在上表 —— 这才是"对方已收到"的证据。
+        断网时板端仍能本地确认,但表里不会有记录,页面也<b>不会</b>显示"对方已收到"。
+        状态:received(已收到,待回应)→ acked(已回应)/ cancelled(已取消)。
+      </div>
+    </section>
+
     <!-- ========== 异常检测 ========== -->
     <section class="card">
       <div class="card-head"><h2>异常检测</h2></div>

@@ -552,6 +552,29 @@
       toast("已刷新任务列表");
     });
 
+    // 按键触发事件(第 3 周)
+    $("eventRefreshBtn")?.addEventListener("click", () => {
+      loadEvents();
+      toast("已刷新事件列表");
+    });
+    // 事件表格里的"回应/取消"用事件委托(表格每次重绘)
+    const evTable = $("eventTable");
+    if (evTable) {
+      evTable.addEventListener("click", async (ev) => {
+        const ackBtn = ev.target.closest("[data-ev-ack]");
+        const cancelBtn = ev.target.closest("[data-ev-cancel]");
+        if (ackBtn) {
+          await Api.ackEvent(ackBtn.getAttribute("data-ev-ack"), "Web 端已回应");
+          loadEvents();
+          toast("已回应");
+        } else if (cancelBtn) {
+          await Api.cancelEvent(cancelBtn.getAttribute("data-ev-cancel"), "Web 端已取消");
+          loadEvents();
+          toast("已取消");
+        }
+      });
+    }
+
     // 页面可见性:切回前台立即刷新
     document.addEventListener("visibilitychange", () => {
       if (!document.hidden && !state.paused) refresh(true);
@@ -698,6 +721,45 @@
     }).join("");
   }
 
+  // ---------- 第 3 周:按键触发事件 ----------
+  const EVENT_STATUS_TEXT = {
+    received: "已收到·待回应",
+    acked: "已回应",
+    cancelled: "已取消",
+  };
+
+  function eventStatusBadge(status) {
+    // 复用任务徽章的配色(pending=蓝 / completed=绿 / timeout=灰)
+    const cls = { received: "pending", acked: "completed", cancelled: "timeout" }[status] || "pending";
+    return `<span class="badge ${cls}">${EVENT_STATUS_TEXT[status] || esc(status)}</span>`;
+  }
+
+  /** 事件列表。列表里只有服务端真正收到过的事件 —— 断网期间的本地触发不会出现。 */
+  async function loadEvents() {
+    const resp = await Api.events(state.groupId, { limit: CONFIG.task.historyLimit });
+    const tbody = document.querySelector("#eventTable tbody");
+    if (!tbody) return;
+    if (!resp.ok || !resp.events || !resp.events.length) {
+      tbody.innerHTML = '<tr><td colspan="5" class="muted">暂无事件。按下板子上的 BOOT 键试一次。</td></tr>';
+      return;
+    }
+    tbody.innerHTML = resp.events.map((e) => {
+      const local = e.local_confirmed_at_ms ? fmtDateTime(e.local_confirmed_at_ms) : "--";
+      const arrived = fmtDateTime(e.received_at_ms);
+      const acted = e.status === "received"
+        ? `<button class="btn small primary" data-ev-ack="${esc(e.event_id)}">回应</button>
+           <button class="btn small" data-ev-cancel="${esc(e.event_id)}">取消</button>`
+        : `<span class="muted">${e.acked_at_ms ? fmtDateTime(e.acked_at_ms) : (e.cancelled_at_ms ? fmtDateTime(e.cancelled_at_ms) : "--")}</span>`;
+      return `<tr>
+        <td>${local}</td>
+        <td>${arrived}</td>
+        <td>${eventStatusBadge(e.status)}</td>
+        <td class="task-rid">${esc(e.event_id)}</td>
+        <td>${acted}</td>
+      </tr>`;
+    }).join("");
+  }
+
   // ---------- 轻量提示 ----------
   let toastTimer = null;
   function toast(msg) {
@@ -727,6 +789,10 @@
     setBanner("info", "正在连接数据服务…");
     refresh(true).then(() => restartTimer());
     loadTaskHistory();   // 初始加载最近任务
+    loadEvents();        // 第 3 周:初始加载按键事件
+
+    // 按键事件独立轮询(设备本地触发,服务端才知道,所以必须自己拉)
+    setInterval(() => { if (!state.paused) loadEvents(); }, 2000);
 
     // 姿态图随最新数据更新
     setInterval(() => {

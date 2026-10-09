@@ -542,6 +542,9 @@ def get_command():
             {"request_id": picked["request_id"], "action": picked["action"]}
             if picked else None
         ),
+        # 给板端对表用:板子没有 RTC,靠这个值把 millis() 换算成墙上时钟,
+        # 这样"本地确认时刻"才能和"服务端收到时刻"做真实对比。
+        "server_time_ms": now,
     })
 
 
@@ -622,8 +625,178 @@ def list_tasks():
     return jsonify({"ok": True, "tasks": items[:limit], "count": len(items)})
 
 
+# ==================================================================
+#  第 3 周:按键触发事件(本地确认 与 远端接收 严格分离)
+#
+#  核心原则(任务卡要求):
+#    - 板端按下按键 → 本地立即确认(屏幕有反馈),这是【本地证据】
+#    - 事件 POST 到服务端 → 才算【远端收到】
+#    - 二者是两件事:断网时本地仍能确认,但服务端没有该事件,
+#      页面绝不能显示"对方已收到"。
+#    - 所以服务端只记录它【真正收到过】的事件,不臆造状态。
+# ==================================================================
+EVENT_FILE = BASE_DIR / "events.json"
+MAX_EVENTS = 200
+
+_event_lock = RLock()
+_events: dict[str, dict] = {}          # event_id -> event
+# 待下发给板端的回应/取消:event_id -> {"action": "ack"|"cancel", "note": str}
+_event_cmds: dict[str, dict] = {}
+
+
+def _persist_events():
+    try:
+        with _event_lock:
+            items = sorted(_events.values(), key=lambda e: e["received_at_ms"])[-MAX_EVENTS:]
+        with EVENT_FILE.open("w", encoding="utf-8") as f:
+            json.dump(items, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"[server] persist events failed: {e}")
+
+
+def _load_events():
+    if not EVENT_FILE.exists():
+        return
+    try:
+        with EVENT_FILE.open("r", encoding="utf-8") as f:
+            items = json.load(f)
+        with _event_lock:
+            for e in items:
+                eid = e.get("event_id")
+                if eid:
+                    _events[eid] = e
+        print(f"[server] loaded {len(_events)} events from {EVENT_FILE}")
+    except Exception as e:
+        print(f"[server] load events failed: {e}")
+
+
+@app.post("/api/event")
+def receive_event():
+    """板端上报一次本地触发。
+
+    板端必须先在本地给出反馈(屏幕),再来上报。
+    这里只登记"服务端确实收到了",不修改板端的本地状态。
+    """
+    body = request.get_json(silent=True) or {}
+    event_id = str(body.get("event_id") or "").strip()
+    if not event_id:
+        return jsonify({"ok": False, "error": "missing event_id"}), 400
+
+    now = int(time.time() * 1000)
+    with _event_lock:
+        if event_id in _events:
+            ev = _events[event_id]          # 重传/重复上报:不重复建,也不改状态
+            ev["resend_count"] = ev.get("resend_count", 0) + 1
+        else:
+            ev = {
+                "event_id": event_id,
+                "group_id": str(body.get("group_id") or "").strip(),
+                "device_id": str(body.get("device_id") or "").strip(),
+                "type": str(body.get("type") or "button_press"),
+                # 板端本地确认时刻(墙上时钟,由板端用 server_time_ms 对表后填)
+                "local_confirmed_at_ms": body.get("local_confirmed_at_ms"),
+                # 兜底:板上电毫秒数,始终有效。local 为 0 表示当时还没对上表
+                "local_uptime_ms": body.get("local_uptime_ms"),
+                # 服务端真正收到的时刻 —— 这才是"远端已收到"的证据
+                "received_at_ms": now,
+                "status": "received",       # received → acked / cancelled
+                "acked_at_ms": None,
+                "cancelled_at_ms": None,
+                "note": str(body.get("note") or ""),
+                "resend_count": 0,
+            }
+            _events[event_id] = ev
+        snapshot = dict(ev)
+    _persist_events()
+    return jsonify({"ok": True, "event": snapshot})
+
+
+@app.get("/api/events")
+def list_events():
+    """事件列表(前端展示)。按服务端收到时间倒序。"""
+    group_id = request.args.get("group_id", "").strip()
+    device_id = request.args.get("device_id", "").strip()
+    try:
+        limit = int(request.args.get("limit", 20))
+    except ValueError:
+        limit = 20
+    limit = max(1, min(limit, 100))
+
+    with _event_lock:
+        items = [
+            dict(e) for e in _events.values()
+            if (not group_id or e["group_id"] == group_id)
+            and (not device_id or e["device_id"] == device_id)
+        ]
+    items.sort(key=lambda e: e["received_at_ms"], reverse=True)
+    return jsonify({"ok": True, "events": items[:limit], "count": len(items)})
+
+
+@app.post("/api/event/<event_id>/ack")
+def ack_event(event_id: str):
+    """远端回应某个事件(页面点"已收到/回应")。
+
+    入队一条 ack 命令,等板端轮询取走 —— 板端收到后才更新自己的屏幕。
+    """
+    body = request.get_json(silent=True) or {}
+    note = str(body.get("note") or "").strip()
+    now = int(time.time() * 1000)
+    with _event_lock:
+        ev = _events.get(event_id)
+        if not ev:
+            return jsonify({"ok": False, "error": "event not found"}), 404
+        if ev["status"] == "cancelled":
+            return jsonify({"ok": False, "error": "event already cancelled"}), 409
+        ev["status"] = "acked"
+        ev["acked_at_ms"] = now
+        if note:
+            ev["note"] = note
+        _event_cmds[event_id] = {"action": "ack", "note": note, "at_ms": now}
+        snapshot = dict(ev)
+    _persist_events()
+    return jsonify({"ok": True, "event": snapshot})
+
+
+@app.post("/api/event/<event_id>/cancel")
+def cancel_event(event_id: str):
+    """远端取消某个事件(页面点"取消")。"""
+    body = request.get_json(silent=True) or {}
+    note = str(body.get("note") or "").strip()
+    now = int(time.time() * 1000)
+    with _event_lock:
+        ev = _events.get(event_id)
+        if not ev:
+            return jsonify({"ok": False, "error": "event not found"}), 404
+        ev["status"] = "cancelled"
+        ev["cancelled_at_ms"] = now
+        if note:
+            ev["note"] = note
+        _event_cmds[event_id] = {"action": "cancel", "note": note, "at_ms": now}
+        snapshot = dict(ev)
+    _persist_events()
+    return jsonify({"ok": True, "event": snapshot})
+
+
+@app.get("/api/event/pending")
+def event_pending():
+    """板端轮询:取走待处理的回应/取消命令。
+
+    返回后立即出队(与第 2 周 /api/command 的语义一致:领走即消费)。
+    """
+    device_id = request.args.get("device_id", "").strip()
+    updates = []
+    with _event_lock:
+        for eid in list(_event_cmds.keys()):
+            cmd = _event_cmds.pop(eid)
+            ev = _events.get(eid)
+            if ev and (not device_id or ev["device_id"] == device_id):
+                updates.append({"event_id": eid, **cmd})
+    return jsonify({"ok": True, "updates": updates})
+
+
 if __name__ == "__main__":
     _load_existing()
     _load_tasks()
+    _load_events()
     # 0.0.0.0 让板子能通过局域网 IP 访问
     app.run(host="0.0.0.0", port=8000, debug=False, threaded=True)

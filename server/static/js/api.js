@@ -109,6 +109,23 @@ const Api = (() => {
     return request(u);
   }
 
+  /** 事件列表(第 3 周)。只含服务端真正收到过的事件 —— 断网期间板端的
+   *  本地触发不会出现在列表里,这正是"本地确认 ≠ 远端收到"的体现。 */
+  function events(groupId, { limit = 10 } = {}) {
+    const u = `${CONFIG.api.eventList}?group_id=${encodeURIComponent(groupId)}&limit=${limit}&_=${nowMs()}`;
+    return request(u);
+  }
+
+  /** 回应某个事件 */
+  function ackEvent(eventId, note = "") {
+    return postJson(`${CONFIG.api.eventAck}/${encodeURIComponent(eventId)}/ack`, { note });
+  }
+
+  /** 取消某个事件 */
+  function cancelEvent(eventId, note = "") {
+    return postJson(`${CONFIG.api.eventCancel}/${encodeURIComponent(eventId)}/cancel`, { note });
+  }
+
   return { request, postJson, latest, history, stats, health, groups, exportCsvUrl,
-           createTask, getTask, tasks };
+           createTask, getTask, tasks, events, ackEvent, cancelEvent };
 })();

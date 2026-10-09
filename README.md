@@ -129,6 +129,30 @@ pending ──> received ──> completed
 - **超时任务绝不回填旧数据**:`timeout` 时 `completed_at_ms=None`、`record_index=None`,页面上不会把上一次的观测标成本次结果。
 - 板端断网时任务停在 `pending`,页面显示"等待设备领取"。
 
+**第 3 周:按键触发事件(事件通道)**
+
+| 接口 | 说明 |
+|------|------|
+| `POST /api/event` | 板端上报一次本地触发(`event_id` / `local_confirmed_at_ms` / `local_uptime_ms`) |
+| `GET /api/events?group_id=G03` | 事件列表(前端"按键触发事件"卡片) |
+| `POST /api/event/<id>/ack` | Web 端回应(远端确认) |
+| `POST /api/event/<id>/cancel` | Web 端取消 |
+| `GET /api/event/pending?device_id=...` | **板端轮询**领取回应/取消命令 |
+
+事件状态机(板端本地视角):
+
+```
+EV_IDLE ──按下 BOOT──> EV_LOCAL ──POST 成功──> EV_SENT ──ack──> EV_ACKED
+                          │                                 └──cancel─> EV_CANCELLED
+                          └──POST 失败(断网)──> 停在 EV_LOCAL
+```
+
+- **核心设计**:`local_confirmed_at_ms`(本地确认)与 `received_at_ms`(服务端收到)
+  是两个独立字段,实测延迟 93~250 ms,可证明两者分离。
+- **断网时停在 `EV_LOCAL`**:屏幕显示黄色 + 红边框 + `NOT delivered`,
+  绝不会显示"对方已收到";服务端也不会凭空生成该事件的记录。
+- 事件持久化在 `server/events.json`。
+
 ### 2.2 Web 平台功能
 
 升级为完整的 **IMU 实时监测与数据分析平台**:
@@ -339,7 +363,22 @@ scripts\verify_week2.py --manual                            # 需人工配合的
 
 > T7 自动脚本里用的是虚构设备 `ghost-offline-01` 做等效逻辑验证;
 > 上面这一项是**真实网络中断**的证据,任务卡要求,建议补一次截图。
-- 上传 `status != "ok"` → 数字变灰 + **失败**。
+
+### 5.3 第 3 周:按键触发与物理反馈闭环
+
+完整验证报告见 `docs/week3-verification.md`。核心是**本地确认**与**远端收到**分开证明:
+
+| 验证项 | 操作 | 期望 |
+|--------|------|------|
+| 本地立即确认 | 按 BOOT | 屏幕下半部**变黄** + 红边框,串口 `[EV] key pressed, local confirmed` |
+| 送达 | 服务在线时按 BOOT | 随即**变青**(`EV_SENT`),服务端事件延迟 93~250 ms |
+| 远端回应闭环 | 页面"按键触发事件"卡片点**回应** | 1~2 秒内屏幕**变绿**,串口 `[EV] remote acked` |
+| 取消 | 点**取消** | 屏幕变红(`EV_CANCELLED`) |
+| **断网本地确认** | 停掉 Flask 服务后按 BOOT | 屏幕**稳定停在黄色** + 红边框 + `NOT delivered` |
+| **不伪造远端证据** | 恢复服务后查 `/api/events` | 离线期间的触发**不在列表里**,事件总数不变 |
+
+**验收要点**:断网时本地仍能确认触发,但**绝不能**显示"对方已收到"。
+板端状态只有拿到服务端回执才会越过 `EV_LOCAL`。
 
 ---
 
@@ -355,6 +394,10 @@ scripts\verify_week2.py --manual                            # 需人工配合的
 | **端口号会变** | 程序运行时创建自己的 USB CDC 设备 | 烧录口(如 COM5)和运行口(如 COM6)可能不同,`arduino-cli board list` 查看 |
 | **数值偏小/偏大**(如静止模长 0.44g) | 芯片灵敏度与手册标称不符(批次/型号差异) | 已内置**重力自动校准**,启动时静止 1 秒即可;也可用 `board/qma_diag` 诊断 |
 | **上传只有 0.5Hz**(代码明明写了 200ms) | S3-EYE 是**原生 USB CDC**,主机没打开串口监视器时 `Serial` 写入会**阻塞等待主机取数据**,把主循环卡住 ~1.8s。表现很反直觉:**开着串口监视器反而是 5Hz,关掉就掉到 0.5Hz** | `setup()` 里加 `Serial.setTxTimeoutMs(0)`(写不进就丢弃,绝不阻塞);并对高频日志做**每秒 1 条**的节流 |
+| **烧录后 COM 口从系统消失** | S3-EYE 偶发 USB 枚举失败 | **拔插 USB**;不行就手动进下载模式:按住 BOOT → 按 RST → 松 RST → 松 BOOT |
+| **屏幕背光不亮**(内容其实已画出) | 背光由 **AO3401A(P 沟道 MOS)** 驱动,栅极接 GPIO48,**低电平才导通点亮**,与直觉相反 | `BL_ON()` 定义为 `digitalWrite(LCD_BL, LOW)` |
+| **按一下 BOOT 产生多条事件** | 用 `if (key_low && 已过防抖时间)` 判断,**按住不放会反复触发** | 改成**下降沿触发**(`key_low && !key_last`) |
+| **时间戳算出几十亿毫秒的荒谬延迟** | ESP32 的 `long` 是**32 位**(最大 21 亿),而墙上时钟毫秒约 **1.79e12**,`(long)(server_time_ms - millis())` 直接溢出 | 偏移量与时间戳一律用 `long long` / `unsigned long long` |
 
 ### 6.2 通用排错
 
@@ -395,12 +438,15 @@ D:\kechengrenwu\123\
 ├── docs\
 │   ├── arduino-ide-setup.md   # Arduino IDE 安装 + 打开 .ino + 烧录全流程(新手看这个)
 │   ├── week2-verification.md  # 第 2 周验证报告(脚本自动生成,含原始输出)
+│   └── week3-verification.md  # 第 3 周验证报告(按键闭环 + 离线本地确认)
 │   └── 项目完整记录.md         # 开发全过程记录:功能/验证/排错/待办
 ├── board\
 │   ├── imu_http\              # 主 sketch(文件夹名必须与 .ino 同名)
 │   │   ├── imu_http.ino       # S3-EYE 采集 + WiFi 上传 + 重力自动校准
 │   │   ├── config.h           # 你的实际配置(含 WiFi 密码,已被 gitignore)
 │   │   └── config.h.example   # 配置模板
+│   ├── lcd_key_probe\         # 探针:LCD 引脚 + 背光极性 + BOOT 键(第 3 周排错用)
+│   └── key_scan\              # 探针:扫描板载按键实际 GPIO(确认 BOOT=GPIO0)
 │   ├── i2c_scan\
 │   │   └── i2c_scan.ino       # I2C 扫描 + 传感器识别(排查用)
 │   ├── qma_diag\
@@ -411,12 +457,13 @@ D:\kechengrenwu\123\
 ├── server\
 │   ├── app.py                 # Flask 接收 + 查询 + 任务指令 + 页面
 │   ├── requirements.txt
-│   ├── templates\index.html    # Web 页面(含第 2 周远程采集卡片)
+│   ├── templates\index.html    # Web 页面(含第 2 周远程采集卡片 + 第 3 周事件卡片)
 │   ├── static\
 │   │   ├── css\style.css      # 样式
 │   │   ├── js\                # config / utils / api / charts / app
 │   │   └── vendor\chart.umd.min.js  # Chart.js 本地化,不依赖 CDN
 │   ├── tasks.json             # 第 2 周任务持久化(运行时生成)
+│   ├── events.json            # 第 3 周事件持久化(运行时生成)
 │   └── data.json              # 运行时生成,落盘原始记录(**JSONL,每行一条**)
 ├── simulator\
 │   └── send_sim.py            # PC 端模拟器(无板子时先用)
