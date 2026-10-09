@@ -1,22 +1,22 @@
 # 开发板 IMU 传感数据采集与 Web 展示系统
 
-> 第 1 周任务:把开发板的真实 IMU 传感数据,通过 WiFi 传到自己的电脑(充当服务器),再用浏览器查看。
+> 课程任务(共 4 周):把开发板的真实 IMU 传感数据经 WiFi 传到本机(充当服务器)再用浏览器查看;随后依次加上远程采集指令、按键触发与本地反馈、自然语言查询。
 >
-> 本仓库提供**板端代码**(ESP32 + MPU6050)、**服务端代码**(Python 本机服务)、**Web 页面**和 **PC 模拟器**(无传感器时也能联调)。
+> 本仓库提供 **板端代码**(ESP32-S3-EYE + 板载 **QMA7981**)、**服务端代码**(Python 本机服务)、**Web 页面**和 **PC 模拟器**(无传感器时也能联调)。
 >
-> 验收要点(对照周任务卡):采集值、单位、时间戳、未更新提示、分组来源、页面无写死数值。
+> **进度**:第 1 周 采集与展示 ✅ · 第 2 周 远程采集指令 ✅ · 第 3 周 按键触发与反馈 ⏳ · 第 4 周 自然语言查询 ⏳
 
 ---
 
-## ⏬ 三阶段路径(从今天起就能动手)
+## ⏬ 三阶段路径
 
-任务卡要求"先完成一个真实传感源与一种已验证网络,再补足其他"。考虑到**还没拿到传感器**,按下面的阶段推进,每天都有可见成果:
+任务卡要求"先完成一个真实传感源与一种已验证网络,再补足其他"。
 
-| 阶段 | 你的状态 | 用什么 | 你要做的 | 结果 |
-|------|----------|--------|----------|------|
-| **A · 现在** | 没板子、没传感器 | PC 模拟器 `send_sim.py` | 第 2 节启服务,第 3 节跑模拟器 | Web 上看到 sin 波形,链条已通 |
-| **B · 拿到板子后** | 有 ESP32 但还没接传感器 | 把 `config.h` 里 `USE_MPU6050` 设为 0,烧录 | 接串口看 WiFi OK,Web 显示 `simulated` 蓝色徽章 | 物理板端联通链路,sin 仍是合成 |
-| **C · 接传感器后** | 已有 MPU6050(GY-521) | 把 `USE_MPU6050` 改回 1,按 §1.3 接线 | 静止时 `acc_z≈9.8 m/s²`,Web 显示 `ok` | 真实采集链路,触发"采集值核对" |
+| 阶段 | 状态 | 用什么 | 结果 |
+|------|------|--------|------|
+| **A · PC 模拟器** | ✅ 已通过 | `simulator/send_sim.py` | 无板子时先跑通链路,Web 上看到 sin 波形 |
+| **B · 板端演示模式** | ✅ 已通过 | `config.h` 里 `USE_QMA7981=0` | 物理板联通链路,Web 显示 `simulated` 蓝色徽章 |
+| **C · 真实传感器** | ✅ **当前阶段** | `USE_QMA7981=1`,板载免接线 | 静止时三轴模长 ≈ 1g,Web 显示 `ok` |
 
 > 章节对应:阶段 A = §2 + §3;阶段 B = §4;阶段 C = §4.3 + §5。
 
@@ -25,23 +25,19 @@
 ## 0. 整体架构
 
 ```
-┌─────────────┐    WiFi    ┌──────────────────┐    HTTP     ┌─────────────┐
-│  ESP32 板端 │ ─────────▶ │  本机 Flask 服务 │ ──────────▶ │  浏览器页面 │
-│  MPU6050    │  POST JSON │  写 data.json    │  GET JSON   │  自动刷新    │
-└─────────────┘            └──────────────────┘             └─────────────┘
-       ▲                              ▲
-       │                              │
-   真实传感源                    也可以从 PC 模拟器发送
-                            (现在没板子时先验证这条链路)
+上传链路  [ESP32-S3 + 板载 QMA7981] --WiFi POST /api/data--> [本机 Flask] --GET--> [浏览器]
+
+指令链路  [浏览器] --POST /api/task--> [Flask] --GET /api/command 1s 轮询--> [ESP32-S3]
+                       request_id            <-------- POST /api/ack 回执 --------
 ```
 
-**三端分工**(对照任务卡前 2 学时要求):
+**三端分工**:
 
 | 端 | 职责 | 产物 |
 |----|------|------|
-| 板端 | 采 IMU 原始值,加时间戳和分组 ID,Wifi HTTP POST | `board/imu_http/imu_http.ino` |
-| 服务端 | 收数据 → 落盘 → 提供查询 API 与首页 | `server/app.py` |
-| 浏览器 | 拉最新值,显示"无数据/超时/失败"三态 | `server/templates/index.html` |
+| 板端 | 采 IMU 原始值,加时间戳和分组 ID,WiFi HTTP POST;**第 2 周**起轮询领取并执行远程指令 | `board/imu_http/imu_http.ino` |
+| 服务端 | 收数据 → 落盘 → 提供查询 API 与首页;**第 2 周**起维护任务状态机 | `server/app.py` |
+| 浏览器 | 拉最新值,显示"无数据/超时/失败"三态;**第 2 周**起下发采集指令并跟踪 `request_id` | `server/templates/index.html` |
 
 ---
 
@@ -96,7 +92,8 @@ python app.py
 
 服务说明:
 - 数据全部落到 `server/data.json`(自动生成),便于直接打开核对原始记录。
-- 板端默认 **5Hz 上传**(200ms 一条),前端默认 **500ms 拉取**。
+- 板端默认 **5Hz 上传**(200ms 一条),前端默认 **200ms 拉取**。
+- 静态资源(`/static/*`)禁用缓存,改完 JS/CSS 刷新页面即生效。
 
 ### 2.1 API 一览
 
@@ -109,6 +106,28 @@ python app.py
 | `GET /api/export.csv?group_id=G03` | 导出 CSV(带 BOM,Excel 中文不乱码) |
 | `GET /api/groups` | 有哪些组在上传 |
 | `GET /api/health` | 服务健康检查 |
+
+**第 2 周:远程采集指令(命令通道)**
+
+| 接口 | 说明 |
+|------|------|
+| `POST /api/task` | 创建任务(体:`{group_id, action}`,action = `sample`/`pause`/`resume`),返回 `request_id` |
+| `GET /api/command` | **板端轮询**领取待执行任务(1s 一次),无任务时返回空 |
+| `POST /api/ack` | 板端回执(已接收 / 执行完成 / 失败) |
+| `GET /api/task/<request_id>` | 查单个任务状态与耗时 |
+| `GET /api/tasks?limit=10` | 任务历史 |
+
+任务状态机:
+
+```
+pending ──> received ──> completed
+   │            └──────> failed
+   └──(超过 15s 未被领取)──> timeout
+```
+
+- 任务持久化在 `server/tasks.json`。
+- **超时任务绝不回填旧数据**:`timeout` 时 `completed_at_ms=None`、`record_index=None`,页面上不会把上一次的观测标成本次结果。
+- 板端断网时任务停在 `pending`,页面显示"等待设备领取"。
 
 ### 2.2 Web 平台功能
 
@@ -124,6 +143,11 @@ python app.py
 - **数据导出**:CSV / JSON
 - **姿态可视化**:基于重力方向的粗略估计(**仅加速度数据,无法得到准确绝对姿态**)
 - **交互**:刷新频率选择、Group ID 持久化、原始 JSON 折叠/复制、曲线显隐
+- **远程采集任务**(第 2 周):
+  - 按钮:`🎯 采集一次`、`⏸ 暂停周期上报`、`▶ 恢复周期上报`
+  - 当前任务状态区:`request_id` + 状态流转(已提交 → 设备已接收 → 完成/失败/超时)+ 耗时
+  - 超时明确提示,**不把旧数据标成本次完成**
+  - 最近任务历史列表(含状态与耗时)
 
 > 阈值等配置集中在 `server/static/js/config.js`,修改阈值不用翻代码。
 
@@ -262,15 +286,22 @@ ESPTOOL="/c/Users/user/AppData/Local/Arduino15/packages/esp32/tools/esptool_py/5
 ```
 
 **板端逻辑要点**:
-- 默认每 50ms 采一次(20Hz),每 1s 算均值并上传一次
+- 默认每 50ms 采一次(20Hz),每 200ms 算均值并上传一次(5Hz),故 `n_samples` 通常为 4
+- 采样用 `while` 补帧:上一轮被 HTTP 拖长时把错过的采样补回,保证采样率不退化
+- 上传日志每秒最多打印 1 行(含真实上传频率与 HTTP 耗时),避免 Serial 阻塞主循环
 - 上传字段:`ts_ms`、`group_id`、`device_id`、`status`、`acc_*_g`(g)、`acc_*`(m/s²)、`rssi`、`n_samples`
 - **启动时自动做重力校准**:静止时三轴模长恒等于 1g,据此反推真实灵敏度(兼容不同批次芯片)
 - WiFi 断连自动重连;HTTP 失败打印状态码
 - 传感器读不到时 `status="sensor_fail"`;演示模式 `status="simulated"`(Web 显示蓝色徽章)
+- **命令通道**(第 2 周):每 1s 轮询 `GET /api/command`,领到任务后执行并 `POST /api/ack` 回执
+  - `sample`:立即采一组并上传,带上该 `request_id`(端到端实测约 0.6s)
+  - `pause` / `resume`:暂停/恢复周期上报,**命令通道在暂停期间照常工作**,所以暂停时仍可"采集一次"
 
 ---
 
 ## 5. 当堂验证(对照周任务卡"当堂验证")
+
+### 5.1 第 1 周:采集与展示
 
 | 验证项 | 操作 | 期望 |
 |--------|------|------|
@@ -286,6 +317,30 @@ ESPTOOL="/c/Users/user/AppData/Local/Arduino15/packages/esp32/tools/esptool_py/5
 - 完全没数据 → 灰色 **无数据**。
 - 上传 `status != "ok"` → 数字变灰 + **失败**。
 
+### 5.2 第 2 周:远程采集指令
+
+**自动验证**(17 项,约 60 秒):
+
+```bash
+cd D:\kechengrenwu\123
+.venv\Scripts\python.exe scripts\verify_week2.py            # 自动项
+scripts\verify_week2.py --manual                            # 需人工配合的 T5
+```
+
+覆盖:T0 在线 / T1 周期上报 / T2 采集一次 / T3 暂停 / T4 暂停中仍可采集 / T6 恢复 / T7 超时不污染旧值。
+结果自动写入 `docs/week2-verification.md`。
+
+**必须人工配合的两项**:
+
+| 项 | 操作 | 期望 |
+|----|------|------|
+| T5 改变设备状态 | 晃动或翻转板子 → 立刻点"采集一次" | 新观测数值确实变化,且带本次 `request_id` |
+| T7 真实设备离线 | **拔掉板子 USB** → 点"采集一次" | 状态走 等待 → **超时**;旧值**不会**被标成本次结果 |
+
+> T7 自动脚本里用的是虚构设备 `ghost-offline-01` 做等效逻辑验证;
+> 上面这一项是**真实网络中断**的证据,任务卡要求,建议补一次截图。
+- 上传 `status != "ok"` → 数字变灰 + **失败**。
+
 ---
 
 ## 6. 排错(嵌入式开发排错过程)
@@ -299,7 +354,7 @@ ESPTOOL="/c/Users/user/AppData/Local/Arduino15/packages/esp32/tools/esptool_py/5
 | **串口完全没反应**(复位后) | 没设 `CDCOnBoot=cdc`,Serial 输出到 UART0,USB 口看不到 | 编译时加 `CDCOnBoot=cdc` |
 | **端口号会变** | 程序运行时创建自己的 USB CDC 设备 | 烧录口(如 COM5)和运行口(如 COM6)可能不同,`arduino-cli board list` 查看 |
 | **数值偏小/偏大**(如静止模长 0.44g) | 芯片灵敏度与手册标称不符(批次/型号差异) | 已内置**重力自动校准**,启动时静止 1 秒即可;也可用 `board/qma_diag` 诊断 |
-| **烧录后无法再烧录** | 程序不停重启(官方已知问题) | 按住 BOOT → 按 RST → 松 RST → 松 BOOT,进入下载模式 |
+| **上传只有 0.5Hz**(代码明明写了 200ms) | S3-EYE 是**原生 USB CDC**,主机没打开串口监视器时 `Serial` 写入会**阻塞等待主机取数据**,把主循环卡住 ~1.8s。表现很反直觉:**开着串口监视器反而是 5Hz,关掉就掉到 0.5Hz** | `setup()` 里加 `Serial.setTxTimeoutMs(0)`(写不进就丢弃,绝不阻塞);并对高频日志做**每秒 1 条**的节流 |
 
 ### 6.2 通用排错
 
@@ -311,6 +366,8 @@ ESPTOOL="/c/Users/user/AppData/Local/Arduino15/packages/esp32/tools/esptool_py/5
 | 编译报 `'Wire' was not declared` | `#include "config.h"` 必须在 `#if USE_*` **之前**(否则宏未定义) |
 | 编译报 `StaticJsonDocument` 不存在 | ArduinoJson 装成了 7.x,降到 6.x |
 | 页面一直是"无数据" | 浏览器 `Network` 看 `/api/latest`;`Group ID` 是否与上传一致 |
+| **改了 JS/CSS 但页面没变化** | 浏览器缓存了旧静态资源。已加 `no-store` 响应头;仍不生效就 `Ctrl+F5` 强刷 |
+| **历史曲线一跳一跳** | 窗口滑动时旧点被挤出、新点进入,全体左移,而 x 轴动画被设为 `duration:0` → 硬瞬移;叠加每 200ms 整体替换 `datasets` 触发入场动画重放。已改为:真实时间轴 + 按绝对时间网格分桶 + 复用 dataset 对象 + 历史图独立降频到 1s |
 | **核心下载极慢/失败** | 见 §6.3 |
 
 ### 6.3 ESP32 核心下载(国内网络)
@@ -336,7 +393,9 @@ D:\kechengrenwu\123\
 ├── README.md                  # 本文件
 ├── .gitignore                 # 排除 config.h / data.json / venv
 ├── docs\
-│   └── arduino-ide-setup.md   # Arduino IDE 安装 + 打开 .ino + 烧录全流程(新手看这个)
+│   ├── arduino-ide-setup.md   # Arduino IDE 安装 + 打开 .ino + 烧录全流程(新手看这个)
+│   ├── week2-verification.md  # 第 2 周验证报告(脚本自动生成,含原始输出)
+│   └── 项目完整记录.md         # 开发全过程记录:功能/验证/排错/待办
 ├── board\
 │   ├── imu_http\              # 主 sketch(文件夹名必须与 .ino 同名)
 │   │   ├── imu_http.ino       # S3-EYE 采集 + WiFi 上传 + 重力自动校准
@@ -350,11 +409,15 @@ D:\kechengrenwu\123\
 │       └── serial_test.ino    # 最小串口测试(排查 USB CDC 是否正常)
 ├── build\                     # 编译产物(.bin/.elf/.map),已 gitignore
 ├── server\
-│   ├── app.py                 # Flask 接收 + 查询 + 页面
+│   ├── app.py                 # Flask 接收 + 查询 + 任务指令 + 页面
 │   ├── requirements.txt
-│   ├── templates\index.html    # Web 页面(自动刷新,蓝色 simulated 徽章)
-│   ├── static\style.css       # 样式
-│   └── data.json              # 运行时生成,落盘原始记录
+│   ├── templates\index.html    # Web 页面(含第 2 周远程采集卡片)
+│   ├── static\
+│   │   ├── css\style.css      # 样式
+│   │   ├── js\                # config / utils / api / charts / app
+│   │   └── vendor\chart.umd.min.js  # Chart.js 本地化,不依赖 CDN
+│   ├── tasks.json             # 第 2 周任务持久化(运行时生成)
+│   └── data.json              # 运行时生成,落盘原始记录(**JSONL,每行一条**)
 ├── simulator\
 │   └── send_sim.py            # PC 端模拟器(无板子时先用)
 └── scripts\
@@ -363,6 +426,7 @@ D:\kechengrenwu\123\
     ├── start_simulator.bat    # 仅起模拟器
     ├── find_local_ip.py       # 列本机 IPv4 + 给出 config.h 写法
     ├── health.py              # 探测 /api/health 和 /api/latest
+    ├── verify_week2.py        # 第 2 周自动验证(17 项,--manual 跑人工项)
     └── push_to_github.bat     # 一键推送到 GitHub
 ```
 
@@ -377,14 +441,39 @@ D:\kechengrenwu\123\
 | `scripts\start_demo.bat`     | "我啥都没但想看页面动起来" | 自动拉双窗口 |
 | `scripts\start_simulator.bat` | 服务已起,只想加模拟器 | 启动 1 个窗口 |
 | `python scripts/health.py`   | 怀疑服务挂了 / 配置错 | 打印 `/api/health` 与 `/api/latest`,给出 last_seen 时长 |
+| `python scripts/verify_week2.py` | 第 2 周验收 | 自动跑 17 项并生成 `docs/week2-verification.md`;`--manual` 只跑需人工配合的 T5 |
 
 ---
 
 ## 9. 提交清单(对应周任务卡"提交与迁移")
 
-- ✅ `board/imu_http/imu_http.ino` + `board/imu_http/config.h`(去敏感信息)
-- ✅ `board/i2c_scan/i2c_scan.ino`(传感器识别记录)
-- ✅ `server/app.py` 等
-- ✅ 一条真实观测日志(打印的串口 + data.json 截屏 + 页面截屏)
-- ✅ 个人修改说明(比如改了采样率、字段名、加了温度)
-- ✅ 个人项目选定的设备数据(本仓库展示 IMU 6 轴 + 温度)
+- ✅ `board/imu_http/imu_http.ino` + `board/imu_http/config.h`(Wi-Fi 密码等敏感信息已剥离,改用 `config.h` 本地配置)
+- ✅ `board/i2c_scan/i2c_scan.ino`(传感器识别记录:扫出 I²C 地址 `0x12` → QMA7981)
+- ✅ `server/app.py` 等(含第 2 周任务 API)
+- ✅ `server/data.json` 真实观测记录(已累计 1 万+ 条 `G03` 真实数据)
+- ⚠️ **串口日志 / 页面截图** —— 待补,建议放在 `docs\` 下
+- ✅ 个人修改说明 —— 见下
+- ✅ 个人项目选定的设备数据 —— **QMA7981 三轴加速度**(非 6 轴,无陀螺仪;**无温度传感器**)
+
+### 9.1 个人修改说明
+
+相对课程原始模板,本项目做了这些改动:
+
+**板端**(`board/imu_http/`)
+1. **换传感器驱动**:板载是 **QMA7981**(I²C `0x12`),不是模板默认的 MPU6050(`0x68`)。自行实现驱动与量程换算。
+2. **启动时重力自动校准**:静止时三轴模长恒等于 1g,据此反推真实 LSB 灵敏度(实测 414.2 LSB/g,标称 1024),兼容不同批次芯片的差异。
+3. **采样/上传频率**:50ms 采样(20Hz)、200ms 上传(5Hz),`n_samples` 通常为 4;采样用 `while` 补帧,被 HTTP 拖长时把错过的采样补回。
+4. **双单位上传**:同时发 `acc_*_g`(g)与 `acc_*`(m/s²),前端不用再换算。
+5. **扩展字段**:增加 `rssi`、`n_samples`、`uptime_s`、`sensor` 型号。
+6. **修复 USB CDC 串口阻塞**(关键):S3-EYE 主机未开串口监视器时 `Serial` 写入会阻塞主循环约 1.8s,导致上传从 5Hz 掉到 0.5Hz。加 `Serial.setTxTimeoutMs(0)` + 日志限流解决,详见 §6.1。
+7. **命令通道**(第 2 周):轮询 `GET /api/command` 执行 `sample`/`pause`/`resume`,回执 `POST /api/ack`;端到端响应约 0.6s。
+
+**服务端**(`server/app.py`)
+8. 第 2 周任务 API 与状态机(`pending→received→completed/failed/timeout`),持久化到 `tasks.json`;**超时任务不回填旧数据**。
+9. 静态资源返回 `no-store`,改完 JS/CSS 刷新即生效(否则浏览器一直用旧文件)。
+10. `data.json` 采用 **JSONL**(每行一条)追加写,抗进程强杀、便于流式核对。
+
+**前端**(`server/static/`)
+11. Chart.js **本地化**到 `vendor/`,不依赖 CDN。
+12. 刷新频率默认 200ms,实时窗口 300 点、历史 800 点,渲染帧率 144fps。
+13. 历史图改用**真实时间轴** + 按绝对时间网格分桶聚合 + 复用 dataset 对象,消除窗口滑动时的跳格与闪烁(详见 §6.2)。
