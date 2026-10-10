@@ -185,26 +185,70 @@ bool qma_read(float &ax_g, float &ay_g, float &az_g) {
 
 // 用重力自动校准:静止时三轴模长恒等于 1g,据此反推真实灵敏度。
 // 不依赖数据手册的标称值,兼容 QMA7981 / QMA6100P 等不同批次芯片。
+//
+// ⚠️ 教训(2026-10-10 实测踩到):插 USB / 拿放板子时难免晃动,若照单全收地把
+// "晃动时的模长"当成 1g,灵敏度会被高估好几倍 —— 实测出现过约 4500 LSB/g
+// (标称 1024),结果静止时模长只有 0.23g,整套数据都是错的,而且看起来还挺稳定。
+// 所以这里加三重保护:
+//   1) 静止判定:一轮采样的相对标准差必须 < 3%,否则认为"还在动",等一会儿重采;
+//   2) 取中位数而不是均值:对个别敲击/尖峰鲁棒;
+//   3) 合理区间:结果必须落在标称值的 0.5~2 倍内,否则判定无效,宁可退回标称值。
+// 原则:**宁可用标称值(偏差几十个百分点),也不要用一个离谱的"校准值"** ——
+// 后者是静默错误,表面稳定,极难发现。
 bool qma_calibrate() {
-  const int N = 60;
-  double sum = 0;
-  int ok = 0;
-  for (int i = 0; i < N; i++) {
-    int16_t x, y, z;
-    qma_read_raw(x, y, z);
-    double m = sqrt((double)x * x + (double)y * y + (double)z * z);
-    if (m > 10) { sum += m; ok++; }
-    delay(15);
+  const int N = 60;          // 每轮采样数(15ms × 60 ≈ 0.9s)
+  const int MAX_ROUND = 6;   // 最多试 6 轮
+  const float NOMINAL = LSB_PER_G;
+
+  for (int round = 0; round < MAX_ROUND; round++) {
+    float mags[N];
+    int n = 0;
+    for (int i = 0; i < N; i++) {
+      int16_t x, y, z;
+      qma_read_raw(x, y, z);
+      double m = sqrt((double)x * x + (double)y * y + (double)z * z);
+      if (m > 10) mags[n++] = (float)m;   // m≈0 说明读失败了,丢弃
+      delay(15);
+    }
+    if (n < N / 2) { delay(300); continue; }   // 有效样本太少,直接重来
+
+    // 插入排序(N 很小,不引入 STL,免得依赖 <algorithm>)
+    for (int i = 1; i < n; i++) {
+      float v = mags[i];
+      int j = i - 1;
+      while (j >= 0 && mags[j] > v) { mags[j + 1] = mags[j]; j--; }
+      mags[j + 1] = v;
+    }
+    float med = mags[n / 2];
+
+    // 相对标准差(以中位数为基准,避免被尖峰带偏)
+    double var = 0;
+    for (int i = 0; i < n; i++) { double d = mags[i] - med; var += d * d; }
+    float rsd = (float)(sqrt(var / n) / (med > 0 ? med : 1));
+
+    if (rsd > 0.03f) {
+      Serial.printf("[QMA] 第 %d 轮:板子还在动(波动 %.1f%%),等稳定后重试\n",
+                    round + 1, rsd * 100);
+      delay(400);
+      continue;
+    }
+    if (med < NOMINAL * 0.5f || med > NOMINAL * 2.0f) {
+      Serial.printf("[QMA] 第 %d 轮:测得 %.0f LSB/g,超出合理区间 %.0f~%.0f,判定无效\n",
+                    round + 1, med, NOMINAL * 0.5f, NOMINAL * 2.0f);
+      delay(400);
+      continue;
+    }
+
+    g_lsb_per_g = med;
+    Serial.printf("[QMA] 重力校准完成:1g = %.1f LSB(第 %d 轮,波动 %.1f%%,标称 %.0f)\n",
+                  g_lsb_per_g, round + 1, rsd * 100, NOMINAL);
+    return true;
   }
-  if (ok < N / 2) {
-    Serial.println("[QMA] 校准失败(数据异常),改用标称值 1024");
-    g_lsb_per_g = 1024.0f;
-    return false;
-  }
-  g_lsb_per_g = (float)(sum / ok);
-  Serial.printf("[QMA] 重力校准完成: 1g = %.1f LSB (采样 %d 次, 标称 1024)\n",
-                g_lsb_per_g, ok);
-  return true;
+
+  Serial.printf("[QMA] 校准失败:多轮都不稳定/不在合理区间,退回标称值 %.0f LSB/g\n", NOMINAL);
+  Serial.println("[QMA] 请把板子静止放好,按 RST 重新校准");
+  g_lsb_per_g = NOMINAL;
+  return false;
 }
 #endif
 
