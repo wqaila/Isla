@@ -521,7 +521,8 @@ D:\kechengrenwu\123\
     ├── find_local_ip.py       # 列本机 IPv4 + 给出 config.h 写法
     ├── health.py              # 探测 /api/health 和 /api/latest
     ├── verify_week2.py        # 第 2 周自动验证(17 项,--manual 跑人工项)
-    └── verify_week4.py        # 第 4 周自动验证(意图 + 数值一致性 + 动作类不谎报)
+    ├── verify_week4.py        # 第 4 周自动验证(意图 + 数值一致性 + 动作类不谎报)
+    └── verify_ui.js           # Web UI 冒烟:puppeteer-core 驱动系统 Edge 真实点击(--shots 产出演示截图)
     └── push_to_github.bat     # 一键推送到 GitHub
 ```
 
@@ -537,6 +538,7 @@ D:\kechengrenwu\123\
 | `scripts\start_simulator.bat` | 服务已起,只想加模拟器 | 启动 1 个窗口 |
 | `python scripts/health.py`   | 怀疑服务挂了 / 配置错 | 打印 `/api/health` 与 `/api/latest`,给出 last_seen 时长 |
 | `python scripts/verify_week2.py` | 第 2 周验收 | 自动跑 17 项并生成 `docs/week2-verification.md`;`--manual` 只跑需人工配合的 T5 |
+| `node scripts/verify_ui.js --shots` | Web UI 层复验 | 用系统 Edge 无头浏览器**真实点击**页面按钮(任务采集、自然语言问答),并截取演示截图到 `docs/screenshots/`;依赖 `puppeteer-core`(见 `.workbuddy` node workspace),不需下载 Chromium |
 | `python scripts/verify_week4.py` | 第 4 周验收 | 17 项:意图识别 + 统计数值与 `/api/stats` 逐位比对 + 动作类不谎报成功 |
 
 ---

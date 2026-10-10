@@ -1145,6 +1145,16 @@ def event_pending():
     return jsonify({"ok": True, "updates": updates})
 
 
+@app.get("/favicon.ico")
+def favicon():
+    """浏览器总会请求 favicon,没有就会在控制台留一条 404 噪音。
+
+    这里直接返回 204(无内容):既消掉噪音,也不必额外引入图标文件。
+    """
+    from flask import Response
+    return Response(status=204)
+
+
 if __name__ == "__main__":
     _load_existing()
     _load_tasks()
