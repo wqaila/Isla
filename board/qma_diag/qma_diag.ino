@@ -20,8 +20,11 @@ void wr(uint8_t reg, uint8_t val) {
   Wire.endTransmission();
 }
 
+// 右对齐 14 位(2026-10-10 实测修正):拼成 16 位后取低 14 位再符号扩展。
+// 旧写法 >>2 会让读数系统性小 4 倍。
 int16_t compose14(uint8_t lsb, uint8_t msb) {
-  uint16_t u = (uint16_t)(((uint16_t)msb << 8) | ((uint16_t)lsb & 0xFC)) >> 2;
+  uint16_t u = ((uint16_t)msb << 8) | (uint16_t)lsb;
+  u &= 0x3FFF;
   if (u & 0x2000) return (int16_t)(u | 0xC000);
   return (int16_t)u;
 }
