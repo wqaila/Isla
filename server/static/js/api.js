@@ -126,6 +126,12 @@ const Api = (() => {
     return postJson(`${CONFIG.api.eventCancel}/${encodeURIComponent(eventId)}/cancel`, { note });
   }
 
+  /** 自然语言查询(第 4 周)。
+   *  服务端最多等板端回执 12 秒,所以这里超时给到 20 秒。 */
+  function nlqQuery(text, { groupId = "", wait = true } = {}) {
+    return postJson(CONFIG.api.nlq, { text, group_id: groupId, wait }, { timeoutMs: 20000 });
+  }
+
   return { request, postJson, latest, history, stats, health, groups, exportCsvUrl,
-           createTask, getTask, tasks, events, ackEvent, cancelEvent };
+           createTask, getTask, tasks, events, ackEvent, cancelEvent, nlqQuery };
 })();

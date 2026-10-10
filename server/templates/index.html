@@ -178,6 +178,41 @@
       </div>
     </section>
 
+    <!-- ========== 自然语言查询(第 4 周) ========== -->
+    <section class="card" id="nlqCard">
+      <div class="card-head">
+        <h2>自然语言查询</h2>
+        <div class="card-actions">
+          <button class="btn small" type="button" data-nlq="现在加速度是多少">当前值</button>
+          <button class="btn small" type="button" data-nlq="最近 5 分钟合加速度的最大值">5 分钟内最大</button>
+          <button class="btn small" type="button" data-nlq="设备还在线吗">设备在线?</button>
+          <button class="btn small" type="button" data-nlq="有多少条数据">数据量</button>
+          <button class="btn small" type="button" data-nlq="最近有几次按键触发">按键次数</button>
+          <button class="btn small" type="button" data-nlq="采集一次">🎯 采集一次</button>
+          <button class="btn small" type="button" data-nlq="你能做什么">帮助</button>
+        </div>
+      </div>
+      <div class="nlq-input">
+        <input id="nlqInput" type="text" maxlength="120"
+               placeholder="用一句话问,例如:最近 5 分钟合加速度的最大值" />
+        <button id="nlqAskBtn" class="btn primary" type="button">提问</button>
+      </div>
+      <div class="nlq-result" id="nlqResult">
+        <div class="muted">还没有提问。可以直接输入,也可以点上方示例按钮。</div>
+      </div>
+      <div class="nlq-history">
+        <div class="task-history-title">最近提问</div>
+        <div id="nlqHistory"><div class="muted">暂无</div></div>
+      </div>
+      <div class="hint">
+        解析规则在 <code>server/nlq.py</code>:纯规则匹配,<b>不调用任何大模型 API</b>,断网也能跑,
+        并且会把"命中的关键词"显示出来 —— 判错了你一眼能看出来,而不是黑箱。
+        「采集一次 / 暂停上报 / 恢复上报」会<b>真的</b>给板子下发任务,走的是与上面第 2 周任务卡片
+        <b>完全相同</b>的通道(等待上限 12 秒);板子离线时如实报超时,
+        <b>不会</b>把"命令已下发"说成"已采集成功"。
+      </div>
+    </section>
+
     <!-- ========== 异常检测 ========== -->
     <section class="card">
       <div class="card-head"><h2>异常检测</h2></div>

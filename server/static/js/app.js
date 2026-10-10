@@ -575,6 +575,19 @@
       });
     }
 
+    // 自然语言查询(第 4 周)
+    const nlqInput = $("nlqInput");
+    $("nlqAskBtn")?.addEventListener("click", () => askNlq(nlqInput ? nlqInput.value : ""));
+    if (nlqInput) {
+      nlqInput.addEventListener("keydown", (e) => {
+        if (e.key === "Enter") askNlq(nlqInput.value);
+      });
+    }
+    // 示例按钮:data-nlq 里写死问句,点一下等于输入并回车
+    document.querySelectorAll("[data-nlq]").forEach((b) => {
+      b.addEventListener("click", () => askNlq(b.getAttribute("data-nlq") || ""));
+    });
+
     // 页面可见性:切回前台立即刷新
     document.addEventListener("visibilitychange", () => {
       if (!document.hidden && !state.paused) refresh(true);
@@ -758,6 +771,98 @@
         <td>${acted}</td>
       </tr>`;
     }).join("");
+  }
+
+  // ---------- 第 4 周:自然语言查询 ----------
+  const NLQ_INTENT_TEXT = {
+    latest: "查当前值", stats: "查统计", count: "查数据量",
+    device_status: "查设备状态", events: "查按键事件",
+    sample: "远程采集", pause: "暂停上报", resume: "恢复上报",
+    help: "帮助", unknown: "没听懂", empty: "空输入",
+  };
+
+  let nlqHistory = [];   // 最近 5 条问答
+
+  /** 渲染回答:同时把"我是怎么理解的"展示出来(命中关键词 + 置信度) */
+  function renderNlqResult(text, res) {
+    const box = $("nlqResult");
+    if (!box) return;
+    const parsed = res.parsed || {};
+    const chips = [`<span class="nlq-chip intent">意图:${esc(NLQ_INTENT_TEXT[res.intent] || res.intent)}</span>`];
+    (parsed.matched || []).forEach((m) => chips.push(`<span class="nlq-chip">${esc(m)}</span>`));
+    if (parsed.confidence !== undefined) {
+      chips.push(`<span class="nlq-chip">置信度 ${esc(parsed.confidence)}</span>`);
+    }
+
+    let taskHtml = "";
+    const task = res.task;
+    if (task && task.request_id) {
+      const elapsed = (task.elapsed_ms !== null && task.elapsed_ms !== undefined)
+        ? `耗时 ${esc(task.elapsed_ms)} ms` : "等待中…";
+      taskHtml = `<div class="nlq-task">
+          ${taskStatusBadge(task.status)}
+          ${taskFlowHtml(task.status)}
+          <span class="rid">${esc(task.request_id)}</span>
+          <span class="muted">${elapsed}</span>
+        </div>`;
+    }
+
+    box.innerHTML = `
+      <div class="nlq-q">Q: ${esc(text)}</div>
+      <div class="nlq-answer">${esc(res.answer || "")}</div>
+      <div class="nlq-meta">${chips.join("")}</div>
+      ${taskHtml}`;
+  }
+
+  function renderNlqHistory() {
+    const box = $("nlqHistory");
+    if (!box) return;
+    if (!nlqHistory.length) { box.innerHTML = '<div class="muted">暂无</div>'; return; }
+    box.innerHTML = nlqHistory.map((h) => `
+      <div class="nlq-history-item">
+        <div class="nlq-history-q">${esc(h.q)}</div>
+        <div class="nlq-history-a">${esc(String(h.a || "").split("\n")[0].slice(0, 90))}</div>
+      </div>`).join("");
+  }
+
+  /** 问一句话。查询类秒回;动作类会真的下发任务并等板端回执(服务端上限 12s)。 */
+  async function askNlq(text) {
+    const q = (text || "").trim();
+    const box = $("nlqResult");
+    const btn = $("nlqAskBtn");
+    if (!box) return;
+    if (!q) { toast("先输入一句话"); return; }
+
+    const input = $("nlqInput");
+    if (input) input.value = q;
+    box.innerHTML = `<div class="nlq-q">Q: ${esc(q)}</div>
+      <div class="nlq-answer loading">查询中…(若是采集/控制类指令,最多等 12 秒)</div>`;
+    if (btn) btn.disabled = true;
+
+    const resp = await Api.nlqQuery(q, { groupId: state.groupId, wait: true });
+    if (btn) btn.disabled = false;
+
+    if (!resp.ok) {
+      box.innerHTML = `<div class="nlq-q">Q: ${esc(q)}</div>
+        <div class="nlq-answer">请求失败:${esc(resp.error || "未知错误")}</div>`;
+      toast("查询失败");
+      return;
+    }
+
+    renderNlqResult(q, resp);
+    nlqHistory.unshift({ q, a: resp.answer || "", intent: resp.intent });
+    nlqHistory = nlqHistory.slice(0, 5);
+    renderNlqHistory();
+
+    // 动作类走的是第 2 周的任务通道,这里让两张卡片保持一致;
+    // 采集成功才立刻拉新数据 —— 超时/失败不谎报"已完成"。
+    if (["sample", "pause", "resume"].indexOf(resp.intent) >= 0) {
+      loadTaskHistory();
+      if (resp.intent === "sample" && resp.task && resp.task.status === "completed") {
+        refresh(true);
+        toast("采集完成");
+      }
+    }
   }
 
   // ---------- 轻量提示 ----------

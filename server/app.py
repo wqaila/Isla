@@ -24,6 +24,8 @@ from threading import Lock, RLock
 
 from flask import Flask, jsonify, render_template, request
 
+import nlq  # 第 4 周:自然语言查询的意图解析(规则式,可离线运行)
+
 BASE_DIR = Path(__file__).resolve().parent
 DATA_FILE = BASE_DIR / "data.json"
 TASK_FILE = BASE_DIR / "tasks.json"
@@ -250,28 +252,22 @@ def _flatten(record: dict) -> dict:
     }
 
 
-@app.get("/api/stats")
-def stats():
-    """对选定时间范围内的数据做统计。
+def _filter_rows(group_id: str = "", since_ms: int | None = None) -> list[dict]:
+    """按 group_id / 时间下界过滤内存记录。
 
-    返回 X/Y/Z 与合加速度的 max/min/avg/std/peak_to_peak,以及采样质量指标。
+    抽出来是为了让第 4 周的 `/api/nlq` 与 `/api/stats` 用同一套过滤口径,
+    避免"页面统计"和"问一句话得到的统计"对不上。
     """
-    group_id = request.args.get("group_id", "").strip()
-    since_ms = request.args.get("since_ms", "").strip()
-    since = None
-    if since_ms:
-        try:
-            since = int(float(since_ms))
-        except ValueError:
-            since = None
-
     with _lock:
-        rows = [
+        return [
             r for r in _records
             if (not group_id or r.get("group_id") == group_id)
-            and (since is None or int(r.get("received_at_ms") or 0) >= since)
+            and (since_ms is None or int(r.get("received_at_ms") or 0) >= since_ms)
         ]
 
+
+def _describe_all(rows: list[dict]) -> dict:
+    """对一批记录算 X/Y/Z/合加速度/RSSI 的统计量 + 采样质量。"""
     def series_of(key):
         vals = []
         for r in rows:
@@ -341,17 +337,37 @@ def stats():
         ratio = (len(recv) / expected) if expected > 0 else 0
         quality["score"] = int(max(0, min(100, round(ratio * 100))))
 
-    return jsonify({
+    return {
         "ok": True,
-        "group_id": group_id or None,
-        "since_ms": since,
         "acc_x": describe(ax),
         "acc_y": describe(ay),
         "acc_z": describe(az),
         "acc_magnitude": describe(mags),
         "rssi": describe(rssi),
         "quality": quality,
-    })
+    }
+
+
+@app.get("/api/stats")
+def stats():
+    """对选定时间范围内的数据做统计。
+
+    返回 X/Y/Z 与合加速度的 max/min/avg/std/peak_to_peak,以及采样质量指标。
+    """
+    group_id = request.args.get("group_id", "").strip()
+    since_ms = request.args.get("since_ms", "").strip()
+    since = None
+    if since_ms:
+        try:
+            since = int(float(since_ms))
+        except ValueError:
+            since = None
+
+    rows = _filter_rows(group_id, since)
+    result = _describe_all(rows)
+    result["group_id"] = group_id or None
+    result["since_ms"] = since
+    return jsonify(result)
 
 
 @app.get("/api/export.csv")
@@ -447,6 +463,338 @@ def health():
 #  第 2 周:Web 远程采集指令与执行结果反馈
 #  流程:Web 创建任务 → 板端拉命令 → 板端采集并回执 → 状态完成/超时
 # ============================================================
+
+def _new_task(group_id: str, device_id: str, action: str) -> dict:
+    """创建一个任务并落盘。
+
+    抽成独立函数,是为了让第 4 周的 `/api/nlq` 能复用同一套创建逻辑,
+    保证「点按钮」和「说一句话」走的是完全相同的代码路径。
+    """
+    now = int(time.time() * 1000)
+    request_id = f"req-{now}-{uuid.uuid4().hex[:6]}"
+    task = {
+        "request_id": request_id,
+        "group_id": group_id,
+        "device_id": device_id,
+        "action": action,
+        "status": "pending",        # pending → received → completed / failed / timeout
+        "created_at_ms": now,
+        "dispatched_at_ms": None,   # 板端拉走命令的时间
+        "received_at_ms": None,     # 板端回执"已接收"
+        "completed_at_ms": None,
+        "elapsed_ms": None,
+        "record_index": None,       # 对应 data.json 里的记录序号
+        "note": "",
+    }
+    with _task_lock:
+        _tasks[request_id] = task
+        # 清理过旧的任务,避免无限增长
+        if len(_tasks) > MAX_TASKS:
+            for rid in sorted(_tasks, key=lambda k: _tasks[k]["created_at_ms"])[:len(_tasks) - MAX_TASKS]:
+                _tasks.pop(rid, None)
+    _persist_tasks()
+    print(f"[task] created {request_id} for {device_id} (group={group_id}, action={action})")
+    return task
+
+
+def _resolve_device_id(group_id: str, device_id: str = "") -> str:
+    """没指定设备时,取该组最近上报过的那个设备。"""
+    device_id = (device_id or "").strip()
+    if device_id:
+        return device_id
+    with _lock:
+        for r in reversed(_records):
+            if r.get("group_id") == group_id:
+                return str(r.get("device_id", ""))
+    return ""
+
+
+# ============================================================
+#  第 4 周:自然语言查询与请求采集
+#
+#  分工:`nlq.py` 只负责"听懂这句话",这里负责"真的去查 / 真的下发任务"。
+#    - 查询类(latest/stats/count/device_status/events)直接读内存记录,纯本地;
+#    - 动作类(sample/pause/resume)复用第 2 周的任务通道 `_new_task()`,
+#      所以"说一句话"和"点按钮"走的是同一条代码路径,结果可以互相对照。
+#    - 板端不在线时,动作类会如实超时,绝不把"已下发"说成"已采集成功"。
+# ============================================================
+NLQ_WAIT_MS = 12000     # 动作类最长等待板端回执的时间(略小于任务超时 15s)
+ONLINE_AGE_MS = 10000   # 最后一条数据距今小于这个值才算"在线"
+
+_METRIC_KEY = {"x": "acc_x", "y": "acc_y", "z": "acc_z", "mag": "acc_magnitude"}
+_METRIC_CN2 = {"x": "X 轴", "y": "Y 轴", "z": "Z 轴", "mag": "合加速度"}
+_AGG_CN2 = {
+    "max": "最大值", "min": "最小值", "avg": "平均值",
+    "std": "标准差", "peak_to_peak": "峰峰值",
+}
+
+
+def _default_group_id() -> str:
+    """没指定组时,用最近一条上报记录的组。"""
+    with _lock:
+        for r in reversed(_records):
+            if r.get("group_id"):
+                return str(r["group_id"])
+    return ""
+
+
+def _human_ago(ms) -> str:
+    if not ms:
+        return "未知"
+    d = int(time.time() * 1000) - int(ms)
+    d = max(d, 0)
+    if d < 1000:
+        return f"{d} 毫秒前"
+    if d < 60_000:
+        return f"{d / 1000:.1f} 秒前"
+    if d < 3_600_000:
+        return f"{d / 60_000:.1f} 分钟前"
+    if d < 86_400_000:
+        return f"{d / 3_600_000:.1f} 小时前"
+    return f"{d / 86_400_000:.1f} 天前"
+
+
+def _fmt_num(v, nd: int = 3) -> str:
+    try:
+        return f"{float(v):.{nd}f}"
+    except (TypeError, ValueError):
+        return "—"
+
+
+def _wait_task(request_id: str, timeout_ms: int = NLQ_WAIT_MS):
+    """等任务进入终态(completed / failed / timeout),返回快照。"""
+    deadline = time.time() + timeout_ms / 1000.0
+    while time.time() < deadline:
+        with _task_lock:
+            t = _tasks.get(request_id)
+            if t:
+                _refresh_task_status(t)
+                if t["status"] in ("completed", "failed", "timeout"):
+                    return dict(t)
+        time.sleep(0.2)
+    with _task_lock:
+        t = _tasks.get(request_id)
+        return dict(t) if t else None
+
+
+def _find_record_of_task(request_id: str):
+    """找到某次采集任务对应上传的那条数据记录(用于把采样值回给用户)。"""
+    if not request_id:
+        return None
+    with _lock:
+        for r in reversed(list(_records)):
+            if r.get("request_id") == request_id:
+                return dict(r)
+            d = r.get("data") or {}
+            if d.get("request_id") == request_id:
+                return dict(r)
+    return None
+
+
+@app.post("/api/nlq")
+def nlq_query():
+    """自然语言查询。body: {"text": "...", "group_id": "G03", "wait": true}
+
+    返回:解析结果 + 一句人类可读的 answer + 结构化 data(前端渲染用)。
+    """
+    body = request.get_json(silent=True) or {}
+    text = str(body.get("text") or "").strip()
+    if not text:
+        # 空输入不算错误:给一句引导,前端直接展示即可
+        return jsonify({
+            "ok": True, "text": "", "intent": "empty", "parsed": nlq.parse(""),
+            "answer": "你还没输入内容。可以试试「现在加速度是多少」。",
+            "data": {}, "task": None,
+        })
+
+    group_id = str(body.get("group_id") or "").strip() or _default_group_id()
+    device_id = str(body.get("device_id") or "").strip()
+    want_wait = body.get("wait")
+    wait = True if want_wait is None else bool(want_wait)
+
+    parsed = nlq.parse(text)
+    intent = parsed["intent"]
+    slots = parsed.get("slots") or {}
+    now = int(time.time() * 1000)
+    since_ms = slots.get("since_ms")
+    since = (now - int(since_ms)) if since_ms else None
+
+    answer = ""
+    data: dict = {}
+    task_snapshot = None
+
+    # ---------------------------------------------------------- 查询类
+    if intent == "latest":
+        rows = _filter_rows(group_id, None)
+        if not rows:
+            answer = f"组 {group_id or '(未知)'} 目前一条数据都没有。"
+        else:
+            r = rows[-1]
+            d = r.get("data") or {}
+            try:
+                x, y, z = float(d.get("acc_x")), float(d.get("acc_y")), float(d.get("acc_z"))
+                mag = (x * x + y * y + z * z) ** 0.5
+            except (TypeError, ValueError):
+                x = y = z = mag = None
+            data = {
+                "record": _flatten(r),
+                "acc_x": x, "acc_y": y, "acc_z": z, "acc_magnitude": mag,
+                "received_at_ms": r.get("received_at_ms"),
+                "age_ms": now - int(r.get("received_at_ms") or 0),
+                "device_id": r.get("device_id"),
+                "rssi": (r.get("data") or {}).get("rssi"),
+            }
+            answer = (
+                f"最新一条(来自 {r.get('device_id') or '未知设备'},{_human_ago(r.get('received_at_ms'))}):"
+                f"X={_fmt_num(x)} Y={_fmt_num(y)} Z={_fmt_num(z)} m/s²,"
+                f"合加速度={_fmt_num(mag)} m/s²(约 {_fmt_num((mag or 0) / 9.80665)} g)。"
+            )
+
+    elif intent == "stats":
+        metric = slots.get("metric", "mag")
+        agg = slots.get("agg", "avg")
+        key = _METRIC_KEY[metric]
+        rows = _filter_rows(group_id, since)
+        st = _describe_all(rows)
+        s = st.get(key)
+        if not s:
+            answer = (
+                f"{'最近 ' + nlq.human_ms(since_ms) if since_ms else '全部'}范围内没有可用数据,"
+                f"算不出{_METRIC_CN2[metric]}的{_AGG_CN2[agg]}。"
+            )
+        else:
+            scope = f"最近 {nlq.human_ms(since_ms)}" if since_ms else "全部数据"
+            data = {"scope": scope, "metric": metric, "agg": agg,
+                    "value": s[agg], "count": s["count"], "stat": s}
+            answer = (
+                f"{scope}({s['count']} 条样本)内,{_METRIC_CN2[metric]}的"
+                f"{_AGG_CN2[agg]} = {_fmt_num(s[agg])} m/s²"
+                f"(最小 {_fmt_num(s['min'])} / 最大 {_fmt_num(s['max'])} / 标准差 {_fmt_num(s['std'])})。"
+            )
+
+    elif intent == "count":
+        rows = _filter_rows(group_id, since)
+        scope = f"最近 {nlq.human_ms(since_ms)}" if since_ms else "全部"
+        with _lock:
+            total = len([r for r in _records if (not group_id or r.get("group_id") == group_id)])
+        data = {"scope": scope, "count": len(rows), "total": total,
+                "duration_s": _describe_all(rows)["quality"]["duration_s"]}
+        answer = f"{scope}共 {len(rows)} 条数据(该组累计 {total} 条)。"
+
+    elif intent == "device_status":
+        rows = _filter_rows(group_id, None)
+        if not rows:
+            answer = f"组 {group_id or '(未知)'} 没有任何上报记录,无法判断设备状态 —— 我不能说它在线。"
+            data = {"online": None}
+        else:
+            r = rows[-1]
+            age = now - int(r.get("received_at_ms") or 0)
+            online = age < ONLINE_AGE_MS
+            recent = _describe_all(_filter_rows(group_id, now - 60_000))["rssi"]
+            data = {
+                "online": online,
+                "device_id": r.get("device_id"),
+                "age_ms": age,
+                "last_seen_ms": r.get("received_at_ms"),
+                "rssi_last": (r.get("data") or {}).get("rssi"),
+                "rssi_avg_1min": recent["avg"] if recent else None,
+                "actual_hz": _describe_all(_filter_rows(group_id, now - 60_000))["quality"]["actual_hz"],
+            }
+            if online:
+                answer = (
+                    f"{r.get('device_id')} 在线:最后一条数据 {_human_ago(r.get('received_at_ms'))},"
+                    f"RSSI {_fmt_num((r.get('data') or {}).get('rssi'), 0)} dBm,"
+                    f"最近 1 分钟实际频率 {data['actual_hz'] or '—'} Hz。"
+                )
+            else:
+                answer = (
+                    f"{r.get('device_id')} 目前离线:最后一条数据是 {_human_ago(r.get('received_at_ms'))}"
+                    f"({time.strftime('%Y-%m-%d %H:%M:%S', time.localtime((r.get('received_at_ms') or 0) / 1000))})。"
+                    f"我不会把它当成在线。"
+                )
+
+    elif intent == "events":
+        with _event_lock:
+            items = [dict(e) for e in _events.values()
+                     if (not group_id or e["group_id"] == group_id)]
+        items.sort(key=lambda e: e["received_at_ms"], reverse=True)
+        unacked = [e for e in items if e["status"] == "received"]
+        data = {"count": len(items), "unacked": len(unacked), "events": items[:10]}
+        if not items:
+            answer = "服务端还没收到过任何按键事件。"
+        else:
+            answer = (
+                f"服务端共收到 {len(items)} 次按键触发,最近一次 {_human_ago(items[0]['received_at_ms'])},"
+                f"其中 {len(unacked)} 次还没被回应。"
+            )
+
+    # ---------------------------------------------------------- 动作类
+    elif intent in ("sample", "pause", "resume"):
+        if not group_id:
+            answer = "还不知道要给哪个组下发(没有任何历史数据可推断),请先确认设备在上报。"
+            return jsonify({"ok": True, "text": text, "intent": intent, "parsed": parsed,
+                            "answer": answer, "data": {}, "task": None})
+        device_id = _resolve_device_id(group_id, device_id)
+        if not device_id:
+            answer = f"组 {group_id} 没有历史数据,推断不出设备 ID,无法下发命令。"
+            return jsonify({"ok": True, "text": text, "intent": intent, "parsed": parsed,
+                            "answer": answer, "data": {}, "task": None})
+
+        task = _new_task(group_id, device_id, intent)
+        task_snapshot = dict(task)
+        if wait:
+            task_snapshot = _wait_task(task["request_id"]) or dict(task)
+
+        status = task_snapshot.get("status")
+        elapsed = task_snapshot.get("elapsed_ms")
+        if status == "completed":
+            if intent == "sample":
+                rec = _find_record_of_task(task_snapshot["request_id"])
+                d = (rec or {}).get("data") or {}
+                data = {"record": _flatten(rec) if rec else None}
+                if rec:
+                    answer = (
+                        f"已采集成功(耗时 {elapsed} ms):"
+                        f"X={_fmt_num(d.get('acc_x'))} Y={_fmt_num(d.get('acc_y'))} "
+                        f"Z={_fmt_num(d.get('acc_z'))} m/s²。"
+                    )
+                else:
+                    answer = f"板端回执已完成(耗时 {elapsed} ms),但没找到对应数据记录。"
+            elif intent == "pause":
+                answer = f"已让板端暂停周期上报(耗时 {elapsed} ms),命令通道仍保持。"
+            else:
+                answer = f"已让板端恢复周期上报(耗时 {elapsed} ms)。"
+        elif status == "failed":
+            answer = f"板端报告执行失败:{task_snapshot.get('note') or '无备注'}。"
+        elif status == "timeout":
+            answer = (
+                f"命令已下发,但 {NLQ_WAIT_MS} ms 内没等到板端回执(超时)。"
+                f"这通常意味着板子离线或断网 —— 我不会把它算作执行成功。"
+            )
+        else:
+            answer = f"命令已下发,当前状态 {status}(板端还没回执)。"
+
+    elif intent == "help":
+        answer = nlq.HELP_TEXT
+        data = {"help": True}
+
+    else:  # unknown / empty
+        answer = (
+            f"没听懂「{text}」。目前我能处理这几类:"
+            "查当前值、查统计、查设备在线、查数据量、查按键事件、远程采集一次、暂停/恢复上报。"
+            "输入「你能做什么」看完整示例。"
+        )
+
+    return jsonify({
+        "ok": True,
+        "text": text,
+        "intent": intent,
+        "parsed": parsed,
+        "answer": answer,
+        "data": data,
+        "task": task_snapshot,
+    })
+
 
 @app.post("/api/task")
 def create_task():

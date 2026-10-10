@@ -418,3 +418,51 @@ footer { text-align: center; padding: 14px; color: var(--text-3); }
   .chart-wrap { height: 170px; }
   .chart-wrap.tall { height: 200px; }
 }
+
+/* ============================================================
+   第 4 周:自然语言查询
+   ============================================================ */
+.nlq-input { display: flex; gap: 8px; margin: 10px 0; }
+.nlq-input input {
+  flex: 1;
+  padding: 7px 11px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: #fff;
+  color: var(--text);
+  font-size: 13px;
+  font-family: inherit;
+}
+.nlq-input input:focus { outline: none; border-color: var(--primary); }
+
+.nlq-result {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 11px 13px;
+  background: #fbfcfe;
+  min-height: 56px;
+}
+.nlq-q { font-size: 12px; color: var(--text-3); margin-bottom: 6px; }
+.nlq-answer { font-size: 14px; line-height: 1.65; color: var(--text); white-space: pre-wrap; }
+.nlq-answer.loading { color: var(--text-3); font-style: italic; }
+.nlq-meta { margin-top: 9px; display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.nlq-chip {
+  font-size: 11.5px;
+  padding: 2px 9px;
+  border-radius: 999px;
+  background: #eef2f7;
+  color: var(--text-2);
+  border: 1px solid var(--border);
+}
+.nlq-chip.intent { background: #dbeafe; color: #1e40af; border-color: #bfdbfe; }
+.nlq-task { margin-top: 9px; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.nlq-task .rid { font-family: ui-monospace, monospace; font-size: 11.5px; color: var(--text-3); }
+
+.nlq-history { margin-top: 12px; }
+.nlq-history-item {
+  display: flex; gap: 10px; padding: 6px 0;
+  border-top: 1px dashed var(--border); font-size: 12.5px;
+}
+.nlq-history-item:first-child { border-top: none; }
+.nlq-history-q { color: var(--text-3); flex: 0 0 38%; }
+.nlq-history-a { color: var(--text); flex: 1; }

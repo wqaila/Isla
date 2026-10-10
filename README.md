@@ -107,6 +107,18 @@ python app.py
 | `GET /api/groups` | 有哪些组在上传 |
 | `GET /api/health` | 服务健康检查 |
 
+**第 4 周:自然语言查询**
+
+| 接口 | 说明 |
+|------|------|
+| `POST /api/nlq` | 一句话进,答案出。体:`{text, group_id, wait}`;返回 `{intent, parsed, answer, data, task}` |
+
+支持的意图:`latest`(当前值)/ `stats`(统计)/ `count`(数据量)/ `device_status`(在线吗)/
+`events`(按键次数)/ `sample`(采集一次)/ `pause` / `resume` / `help`。
+解析发生在 `server/nlq.py` —— **纯规则匹配,不调用任何大模型 API,断网也能跑**,
+并把命中的关键词一并返回,判错了页面上一眼看得出。
+动作类(`sample`/`pause`/`resume`)复用第 2 周的 `_new_task()`,与"远程采集任务"卡片同一条代码路径。
+
 **第 2 周:远程采集指令(命令通道)**
 
 | 接口 | 说明 |
@@ -172,6 +184,12 @@ EV_IDLE ──按下 BOOT──> EV_LOCAL ──POST 成功──> EV_SENT ─�
   - 当前任务状态区:`request_id` + 状态流转(已提交 → 设备已接收 → 完成/失败/超时)+ 耗时
   - 超时明确提示,**不把旧数据标成本次完成**
   - 最近任务历史列表(含状态与耗时)
+- **自然语言查询**(第 4 周):
+  - 输入框 + 7 个示例按钮(当前值 / 5 分钟内最大 / 设备在线? / 数据量 / 按键次数 / 🎯 采集一次 / 帮助)
+  - 回答区同时显示**意图 + 命中的关键词 + 置信度**,判错了用户一眼看得出
+  - 查询类秒回;「采集一次」等动作类真的下发任务,并展示任务状态流转与 `request_id`
+  - 最近 5 条问答留痕,便于当场复现
+  - 解析在 `server/nlq.py`(纯规则),**不调用大模型 API,断网可用**
 
 > 阈值等配置集中在 `server/static/js/config.js`,修改阈值不用翻代码。
 
@@ -380,6 +398,29 @@ scripts\verify_week2.py --manual                            # 需人工配合的
 **验收要点**:断网时本地仍能确认触发,但**绝不能**显示"对方已收到"。
 板端状态只有拿到服务端回执才会越过 `EV_LOCAL`。
 
+### 5.4 第 4 周:自然语言查询与请求采集
+
+完整验证报告见 `docs/week4-verification.md`。
+
+```bash
+python scripts/verify_week4.py        # 自动项(17 项,约 20 秒)
+python server/nlq.py                  # 只测意图解析,13/13
+```
+
+覆盖:12 句话的意图识别、**统计数值与 `/api/stats` 逐位一致**、动作类确实创建任务。
+
+| 验证项 | 操作 | 期望 |
+|--------|------|------|
+| 查询类 | 页面"自然语言查询"卡片输入「现在加速度是多少」 | 秒回三轴值与"多久之前" |
+| 可解释 | 看回答下方的小标签 | 显示意图、命中的关键词、置信度 |
+| 统计一致 | 「最近一天合加速度的最大值」 | 与"历史数据分析"卡片同窗口数值**完全相同**(脚本已逐位比对) |
+| 没听懂时 | 输入「帮我看看天气」 | 明说没听懂 + 给出能做什么,不瞎猜 |
+| **采集一次** | 板子在线时输入「采集一次」 | 真的下发任务并等回执(≤12s),回答里给出本次采样值与耗时 |
+| **离线不谎报** | 板子离线时输入「采集一次」 | 如实说"没等到回执",**不会**出现"成功"字样 |
+
+> **最关键的一条**:「命令已下发」≠「已采集成功」。
+> 板子离线时任务停在 `pending`,答案里绝不出现"成功",旧数据也不会被标成本次结果。
+
 ---
 
 ## 6. 排错(嵌入式开发排错过程)
@@ -439,6 +480,7 @@ D:\kechengrenwu\123\
 │   ├── arduino-ide-setup.md   # Arduino IDE 安装 + 打开 .ino + 烧录全流程(新手看这个)
 │   ├── week2-verification.md  # 第 2 周验证报告(脚本自动生成,含原始输出)
 │   └── week3-verification.md  # 第 3 周验证报告(按键闭环 + 离线本地确认)
+│   └── week4-verification.md  # 第 4 周验证报告(自然语言查询 + 不谎报成功)
 │   └── 项目完整记录.md         # 开发全过程记录:功能/验证/排错/待办
 ├── board\
 │   ├── imu_http\              # 主 sketch(文件夹名必须与 .ino 同名)
@@ -455,9 +497,10 @@ D:\kechengrenwu\123\
 │       └── serial_test.ino    # 最小串口测试(排查 USB CDC 是否正常)
 ├── build\                     # 编译产物(.bin/.elf/.map),已 gitignore
 ├── server\
-│   ├── app.py                 # Flask 接收 + 查询 + 任务指令 + 页面
+│   ├── app.py                 # Flask 接收 + 查询 + 任务指令 + 事件 + 自然语言查询
+│   ├── nlq.py                 # 第 4 周:意图解析(纯规则,可离线单测)
 │   ├── requirements.txt
-│   ├── templates\index.html    # Web 页面(含第 2 周远程采集卡片 + 第 3 周事件卡片)
+│   ├── templates\index.html    # Web 页面(第 2 周远程采集 + 第 3 周事件 + 第 4 周自然语言查询卡片)
 │   ├── static\
 │   │   ├── css\style.css      # 样式
 │   │   ├── js\                # config / utils / api / charts / app
@@ -474,6 +517,7 @@ D:\kechengrenwu\123\
     ├── find_local_ip.py       # 列本机 IPv4 + 给出 config.h 写法
     ├── health.py              # 探测 /api/health 和 /api/latest
     ├── verify_week2.py        # 第 2 周自动验证(17 项,--manual 跑人工项)
+    └── verify_week4.py        # 第 4 周自动验证(意图 + 数值一致性 + 动作类不谎报)
     └── push_to_github.bat     # 一键推送到 GitHub
 ```
 
@@ -489,6 +533,7 @@ D:\kechengrenwu\123\
 | `scripts\start_simulator.bat` | 服务已起,只想加模拟器 | 启动 1 个窗口 |
 | `python scripts/health.py`   | 怀疑服务挂了 / 配置错 | 打印 `/api/health` 与 `/api/latest`,给出 last_seen 时长 |
 | `python scripts/verify_week2.py` | 第 2 周验收 | 自动跑 17 项并生成 `docs/week2-verification.md`;`--manual` 只跑需人工配合的 T5 |
+| `python scripts/verify_week4.py` | 第 4 周验收 | 17 项:意图识别 + 统计数值与 `/api/stats` 逐位比对 + 动作类不谎报成功 |
 
 ---
 
@@ -519,6 +564,13 @@ D:\kechengrenwu\123\
 8. 第 2 周任务 API 与状态机(`pending→received→completed/failed/timeout`),持久化到 `tasks.json`;**超时任务不回填旧数据**。
 9. 静态资源返回 `no-store`,改完 JS/CSS 刷新即生效(否则浏览器一直用旧文件)。
 10. `data.json` 采用 **JSONL**(每行一条)追加写,抗进程强杀、便于流式核对。
+11. **第 4 周自然语言查询**:`server/nlq.py` 做规则式意图解析 —— 不调用大模型 API、断网可跑,
+    并把命中的关键词一并返回(页面展示成标签),判错了用户一眼看得出而不是黑箱。
+    执行端 `/api/nlq` 的动作类(`sample`/`pause`/`resume`)复用第 2 周的 `_new_task()`,
+    与"点按钮"完全同一条代码路径;统计口径与 `/api/stats` 共用 `_describe_all()`,
+    保证"问一句话"和"看统计表"永远是两个相同的数字。
+12. 统计逻辑从 `/api/stats` 里抽成 `_filter_rows()` + `_describe_all()` 两个函数,
+    `scripts/verify_week4.py` 会逐位比对两条路径的输出,改歪了立刻变红。
 
 **前端**(`server/static/`)
 11. Chart.js **本地化**到 `vendor/`,不依赖 CDN。

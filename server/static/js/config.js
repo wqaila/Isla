@@ -19,6 +19,8 @@ const CONFIG = {
     eventList: "/api/events",     // GET 事件列表(只含服务端真正收到过的)
     eventAck: "/api/event",       // POST /api/event/<id>/ack   回应
     eventCancel: "/api/event",    // POST /api/event/<id>/cancel 取消
+    // 第 4 周:自然语言查询
+    nlq: "/api/nlq",              // POST 一句话 → 解析 + 查询/下发
   },
 
   // ---------- 远程采集任务 ----------
