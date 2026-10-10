@@ -239,6 +239,9 @@ def _flatten(record: dict) -> dict:
         "group_id": record.get("group_id"),
         "device_id": record.get("device_id"),
         "status": record.get("status"),
+        # 响应采集任务时板端会把 request_id 放在 data 里,顶层也可能有
+        # (第 2 周验收要点:新观测必须能追溯到是哪次采集请求产生的)
+        "request_id": record.get("request_id") or d.get("request_id"),
         "acc_x": d.get("acc_x"),
         "acc_y": d.get("acc_y"),
         "acc_z": d.get("acc_z"),
