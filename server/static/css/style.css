@@ -466,3 +466,6 @@ footer { text-align: center; padding: 14px; color: var(--text-3); }
 .nlq-history-item:first-child { border-top: none; }
 .nlq-history-q { color: var(--text-3); flex: 0 0 38%; }
 .nlq-history-a { color: var(--text); flex: 1; }
+
+/* 重力自检不合格时的红色文本 */
+.bad-text { color: var(--err); }

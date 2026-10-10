@@ -203,6 +203,18 @@
     if (rec.status && rec.status !== "ok" && rec.status !== "simulated") {
       list.push({ level: "error", text: `设备上报状态异常:${rec.status}` });
     }
+    // 7) 重力自检:静止时合加速度必须 ≈1g —— 这条专门抓"静默的系统性错误"
+    //    (校准被晃动污染 → 0.23g;某轴受冲击卡住 → 4.7g)。曲线平滑、看不出毛病,
+    //    但整套数据是错的,只能靠"静止时模长恒等于 1g"这个物理事实把它揪出来。
+    const san = gravitySanity();
+    if (san && !san.ok) {
+      list.push({
+        level: "error",
+        text: `重力自检失败:静止时合加速度 ${san.med.toFixed(2)} m/s²(≈${(san.med / 9.80665).toFixed(2)} g,` +
+              `应≈1 g)。这不是噪声,是整套数据失衡 —— 请让板子静止后按 RST 重新校准,` +
+              `若仍异常则断电再上电(传感器可能受冲击后读数卡住)`,
+      });
+    }
     return list;
   }
 
@@ -248,10 +260,41 @@
         ["重复时间戳", q.duplicate_ts],
         ["时长", q.duration_s + " s"],
       ];
+      // 合理性校验:静止时合加速度必须 ≈ 1g。这一条能抓住"静默的系统性错误" ——
+      // 例如启动时被晃动污染了校准(实测出现过 0.23g)、或某轴受冲击后读数卡住(实测 4.7g)。
+      // 这类错误曲线平滑、数值稳定,不主动查根本发现不了。
+      const san = gravitySanity();
+      rows.push(["重力自检", san === null ? "样本不足"
+        : san.ok ? `✓ ${san.med.toFixed(2)} m/s²(≈${(san.med / 9.80665).toFixed(2)} g)`
+                 : `✕ ${san.med.toFixed(2)} m/s²(≈${(san.med / 9.80665).toFixed(2)} g,应 ≈1 g)`]);
       detail.innerHTML = rows.map(([k, v]) =>
-        `<div class="qrow"><span>${k}</span><b>${v}</b></div>`
+        `<div class="qrow"><span>${k}</span><b class="${(k === "重力自检" && san && !san.ok) ? "bad-text" : ""}">${v}</b></div>`
       ).join("");
     }
+  }
+
+  /** 重力自检:取最近 20 条模长的中位数,若"很稳定"(MAD < 5%)却明显不是 1g,
+   *  说明传感器/校准有问题 —— 静止物体不可能持续受 4.7g,也不可能只有 0.23g。
+   *  运动时(晃动中)不判定,避免误报。返回 null=样本不足。 */
+  function gravitySanity() {
+    const recs = state.lastRecords || [];
+    if (recs.length < 10) return null;
+    const mags = recs.slice(-20).map((r) => {
+      const d = r.data || r;
+      const x = Number(d.acc_x), y = Number(d.acc_y), z = Number(d.acc_z);
+      if (!isFinite(x) || !isFinite(y) || !isFinite(z)) return null;
+      return Math.sqrt(x * x + y * y + z * z);
+    }).filter((v) => v !== null);
+    if (mags.length < 10) return null;
+
+    const sorted = mags.slice().sort((a, b) => a - b);
+    const med = sorted[Math.floor(sorted.length / 2)];
+    // 中位绝对偏差(MAD):衡量"稳不稳"
+    const devs = mags.map((v) => Math.abs(v - med)).sort((a, b) => a - b);
+    const mad = devs[Math.floor(devs.length / 2)];
+    const stable = med > 0 && (mad / med) < 0.05;      // 稳定 = 基本静止
+    const off = Math.abs(med - 9.80665) / 9.80665;
+    return { med, mad, stable, off, ok: !(stable && off > 0.25) };
   }
 
   // ---------- 统计 ----------
