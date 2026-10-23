@@ -128,10 +128,47 @@ const Api = (() => {
 
   /** 自然语言查询(第 4 周)。
    *  服务端最多等板端回执 12 秒,所以这里超时给到 20 秒。 */
-  function nlqQuery(text, { groupId = "", wait = true } = {}) {
-    return postJson(CONFIG.api.nlq, { text, group_id: groupId, wait }, { timeoutMs: 20000 });
+  /** 自然语言查询。extra: {channel, sessionId, inputEndMs, delayMs}(第 5/6 周语音入口用) */
+  function nlqQuery(text, { groupId = "", wait = true, channel = "", sessionId = "",
+                            inputEndMs = null, delayMs = 0 } = {}) {
+    return postJson(CONFIG.api.nlq, {
+      text, group_id: groupId, wait,
+      channel: channel || undefined,
+      session_id: sessionId || undefined,
+      input_end_ms: inputEndMs || undefined,
+      delay_ms: delayMs || undefined,
+    }, { timeoutMs: 30000 });
+  }
+
+  /** 第 5 周:授权录音文件识别(备用路径,服务器离线 Vosk)。file: File(input[type=file]) */
+  async function voiceAsr(file) {
+    try {
+      const fd = new FormData();
+      fd.append("audio", file, file.name || "recording.wav");
+      const resp = await fetch(CONFIG.api.voiceAsr, { method: "POST", body: fd, cache: "no-store" });
+      const json = await resp.json().catch(() => ({}));
+      if (!resp.ok || !json.ok) {
+        return { ok: false, error: json.error || `HTTP ${resp.status}` };
+      }
+      return json;
+    } catch (e) {
+      return { ok: false, error: (e && e.message) || "网络错误" };
+    }
+  }
+
+  /** 第 6 周:取消当前语音交互 */
+  function voiceCancel(sessionId, requestId) {
+    return postJson(CONFIG.api.voiceCancel, {
+      session_id: sessionId || "", request_id: requestId || "",
+    });
+  }
+
+  /** 第 6 周:交互日志(时序记录) */
+  function voiceLog(limit = 8) {
+    return request(`${CONFIG.api.voiceLog}?limit=${limit}&_=${nowMs()}`);
   }
 
   return { request, postJson, latest, history, stats, health, groups, exportCsvUrl,
-           createTask, getTask, tasks, events, ackEvent, cancelEvent, nlqQuery };
+           createTask, getTask, tasks, events, ackEvent, cancelEvent, nlqQuery,
+           voiceAsr, voiceCancel, voiceLog };
 })();

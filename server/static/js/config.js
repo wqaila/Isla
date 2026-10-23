@@ -21,6 +21,10 @@ const CONFIG = {
     eventCancel: "/api/event",    // POST /api/event/<id>/cancel 取消
     // 第 4 周:自然语言查询
     nlq: "/api/nlq",              // POST 一句话 → 解析 + 查询/下发
+    // 第 5/6 周:语音助手
+    voiceAsr: "/api/voice/asr",       // POST 授权录音文件识别(备用路径)
+    voiceCancel: "/api/voice/cancel", // POST 取消当前语音交互
+    voiceLog: "/api/voice/log",       // GET 交互日志(时序记录)
   },
 
   // ---------- 远程采集任务 ----------
@@ -28,6 +32,15 @@ const CONFIG = {
     pollIntervalMs: 1000,    // 任务状态轮询间隔
     pollTimeoutMs: 20000,    // 前端等待任务完成的上限(超时后不再轮询,以服务器状态为准)
     historyLimit: 5,         // 最近任务列表条数
+  },
+
+  // ---------- 语音助手(第 5/6 周) ----------
+  voice: {
+    lang: "zh-CN",           // 识别语言
+    holdMs: 400,             // 按住超过这么久算"按住说话",否则算"点击切换"
+    maxRecordMs: 20000,      // 单次录音上限(到点自动结束,防止忘按停止)
+    injectDelayMs: 6000,     // "慢响应演示"注入的延迟(复现迟到)
+    historyLimit: 8,         // 最近会话列表条数
   },
 
   // ---------- 默认值 ----------

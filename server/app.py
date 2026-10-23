@@ -157,18 +157,30 @@ def receive_data():
     req_id = data.get("request_id")
     if req_id:
         matched = False
+        late = False
         with _task_lock:
             task = _tasks.get(str(req_id))
             if task:
-                task["status"] = "completed"
-                task["completed_at_ms"] = record["received_at_ms"]
-                task["elapsed_ms"] = record["received_at_ms"] - task["created_at_ms"]
-                task["record_index"] = len(_records) - 1
-                matched = True
+                if task.get("cancelled"):
+                    # 第 6 周:取消之后才上传的数据属于"迟到结果" ——
+                    # 数据本身保留(它是真实采样),但任务状态绝不回退,
+                    # 也不会被算作"这次采集成功"(取消后迟到结果不触发动作)。
+                    task["late_ack"] = True
+                    task["note"] = (task.get("note") or "") + "[late data 已忽略]"
+                    late = True
+                else:
+                    task["status"] = "completed"
+                    task["completed_at_ms"] = record["received_at_ms"]
+                    task["elapsed_ms"] = record["received_at_ms"] - task["created_at_ms"]
+                    task["record_index"] = len(_records) - 1
+                    matched = True
         # 注意:持久化必须放在锁块之外,避免与 _persist_tasks 内部的加锁冲突
         if matched:
             _persist_tasks()
             print(f"[task] {req_id} completed in {task['elapsed_ms']} ms")
+        elif late:
+            _persist_tasks()
+            print(f"[task] {req_id} LATE data after cancel (ignored)")
 
     return jsonify({"ok": True, "count": len(_records)})
 
@@ -467,11 +479,12 @@ def health():
 #  流程:Web 创建任务 → 板端拉命令 → 板端采集并回执 → 状态完成/超时
 # ============================================================
 
-def _new_task(group_id: str, device_id: str, action: str) -> dict:
+def _new_task(group_id: str, device_id: str, action: str, channel: str = "") -> dict:
     """创建一个任务并落盘。
 
     抽成独立函数,是为了让第 4 周的 `/api/nlq` 能复用同一套创建逻辑,
     保证「点按钮」和「说一句话」走的是完全相同的代码路径。
+    channel: "text" / "voice" —— 记录任务从哪个交互入口来(第 5 周)。
     """
     now = int(time.time() * 1000)
     request_id = f"req-{now}-{uuid.uuid4().hex[:6]}"
@@ -480,13 +493,17 @@ def _new_task(group_id: str, device_id: str, action: str) -> dict:
         "group_id": group_id,
         "device_id": device_id,
         "action": action,
-        "status": "pending",        # pending → received → completed / failed / timeout
+        "status": "pending",        # pending → received → completed / failed / timeout / cancelled
         "created_at_ms": now,
         "dispatched_at_ms": None,   # 板端拉走命令的时间
         "received_at_ms": None,     # 板端回执"已接收"
         "completed_at_ms": None,
         "elapsed_ms": None,
         "record_index": None,       # 对应 data.json 里的记录序号
+        "cancelled": False,         # 第 6 周:用户中途取消
+        "cancelled_at_ms": None,
+        "late_ack": False,          # 第 6 周:取消之后才到的回执(迟到结果,已忽略)
+        "channel": channel,         # 第 5 周:text / voice —— 这个任务从哪个入口来
         "note": "",
     }
     with _task_lock:
@@ -565,14 +582,18 @@ def _fmt_num(v, nd: int = 3) -> str:
 
 
 def _wait_task(request_id: str, timeout_ms: int = NLQ_WAIT_MS):
-    """等任务进入终态(completed / failed / timeout),返回快照。"""
+    """等任务进入终态(completed / failed / timeout / cancelled),返回快照。
+
+    第 6 周:cancelled 也是终态 —— 用户点了"停止"就不必再等板端,
+    板端迟到的回执由 ack 接口标记 late_ack,不会被当成执行成功。
+    """
     deadline = time.time() + timeout_ms / 1000.0
     while time.time() < deadline:
         with _task_lock:
             t = _tasks.get(request_id)
             if t:
                 _refresh_task_status(t)
-                if t["status"] in ("completed", "failed", "timeout"):
+                if t["status"] in ("completed", "failed", "timeout", "cancelled"):
                     return dict(t)
         time.sleep(0.2)
     with _task_lock:
@@ -594,21 +615,141 @@ def _find_record_of_task(request_id: str):
     return None
 
 
+# ============================================================
+#  第 5/6 周:语音交互 —— 会话、计时、取消与迟到结果隔离
+#
+#  设计(对照第 6 周任务卡):
+#  - 每次语音交互有 session_id;动作类任务另有 request_id,两者关联进同一份日志;
+#  - 取消(cancel)同时标记「会话取消」和「任务取消」:
+#      · 任务还没创建 → 睡醒后不再下发(取消后不会补触发);
+#      · 任务已下发 → 状态置 cancelled,板端迟到的回执标记 late_ack 并忽略;
+#  - 测量三个时间:输入结束 → 首次反馈(服务端响应)、输入结束 → 任务完成。
+# ============================================================
+VOICE_LOG_FILE = BASE_DIR / "voice_log.jsonl"
+_voice_sessions: dict[str, dict] = {}   # session_id -> {"cancelled": bool, "cancelled_at_ms": int|None}
+_voice_history: deque = deque(maxlen=200)  # 最近交互日志(内存)
+_voice_lock = Lock()
+
+
+def _voice_session_touch(session_id: str) -> None:
+    """登记一个会话(首次见到就建档)。"""
+    if not session_id:
+        return
+    with _voice_lock:
+        _voice_sessions.setdefault(session_id, {"cancelled": False, "cancelled_at_ms": None})
+
+
+def _voice_session_cancelled(session_id: str) -> bool:
+    if not session_id:
+        return False
+    with _voice_lock:
+        s = _voice_sessions.get(session_id)
+        return bool(s and s.get("cancelled"))
+
+
+def _voice_session_cancel(session_id: str) -> bool:
+    """取消会话。返回 True 表示本次调用真的执行了取消(重复调用返回 False)。"""
+    if not session_id:
+        return False
+    with _voice_lock:
+        s = _voice_sessions.setdefault(session_id, {"cancelled": False, "cancelled_at_ms": None})
+        if s.get("cancelled"):
+            return False
+        s["cancelled"] = True
+        s["cancelled_at_ms"] = int(time.time() * 1000)
+        return True
+
+
+def _with_voice(resp: dict, channel: str, session_id: str,
+                input_end_ms, request_at_ms: int, task) -> dict:
+    """给 /api/nlq 响应附上语音入口的计时信息,并记录一次交互日志。"""
+    _voice_session_touch(session_id)
+    respond_at_ms = int(time.time() * 1000)
+    timing = {
+        "channel": channel,
+        "session_id": session_id,
+        "input_end_ms": input_end_ms,
+        "request_at_ms": request_at_ms,
+        "respond_at_ms": respond_at_ms,
+        "respond_ms": respond_at_ms - request_at_ms,                      # 服务端处理耗时
+        "first_feedback_ms": (respond_at_ms - input_end_ms) if input_end_ms else None,  # 输入结束→首次反馈
+        "task_completed_ms": None,                                        # 输入结束→任务完成
+    }
+    if task:
+        st = task.get("status")
+        cat = task.get("completed_at_ms")
+        if st in ("completed", "failed", "timeout", "cancelled") and cat and input_end_ms:
+            timing["task_completed_ms"] = cat - input_end_ms
+    resp["voice"] = timing
+    _log_voice_session(resp, task)
+    return resp
+
+
+def _log_voice_session(resp: dict, task) -> None:
+    """把一次交互写进 voice_log.jsonl(语言交互版本 / 时序记录,提交与迁移用)。"""
+    try:
+        v = resp.get("voice") or {}
+        entry = {
+            "session_id": v.get("session_id"),
+            "channel": v.get("channel"),
+            "text": resp.get("text"),
+            "intent": resp.get("intent"),
+            "answer": (resp.get("answer") or "")[:200],
+            "request_id": (task or {}).get("request_id"),
+            "task_status": (task or {}).get("status"),
+            "cancelled": bool((task or {}).get("cancelled")) or _voice_session_cancelled(v.get("session_id") or ""),
+            "late_ack": bool((task or {}).get("late_ack")),
+            "input_end_ms": v.get("input_end_ms"),
+            "request_at_ms": v.get("request_at_ms"),
+            "respond_at_ms": v.get("respond_at_ms"),
+            "first_feedback_ms": v.get("first_feedback_ms"),
+            "task_completed_ms": v.get("task_completed_ms"),
+            "created_at_ms": int(time.time() * 1000),
+        }
+        with _voice_lock:
+            _voice_history.append(entry)
+            with VOICE_LOG_FILE.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except Exception as e:
+        print(f"[voice] log failed: {e}")
+
+
 @app.post("/api/nlq")
 def nlq_query():
     """自然语言查询。body: {"text": "...", "group_id": "G03", "wait": true}
 
     返回:解析结果 + 一句人类可读的 answer + 结构化 data(前端渲染用)。
+
+    第 5 周语音入口复用本接口(同一条代码路径),附加参数:
+      channel      "text" / "voice" —— 任务从哪个交互入口来
+      session_id   一次语音交互的标识(第 6 周用 request_id/session_id 关联日志)
+      input_end_ms 用户"说完话"的客户端时间戳(用于测量 输入结束→首次反馈)
+      delay_ms     演示用延迟注入(0~10000),复现"慢响应/迟到"(第 6 周)
     """
     body = request.get_json(silent=True) or {}
     text = str(body.get("text") or "").strip()
+    request_at_ms = int(time.time() * 1000)
+    channel = str(body.get("channel") or "text").strip() or "text"
+    session_id = str(body.get("session_id") or "").strip()
+    input_end_ms = body.get("input_end_ms")
+    try:
+        input_end_ms = int(input_end_ms) if input_end_ms else None
+    except (TypeError, ValueError):
+        input_end_ms = None
+    try:
+        delay_ms = max(0, min(10000, int(body.get("delay_ms") or 0)))
+    except (TypeError, ValueError):
+        delay_ms = 0
+
     if not text:
         # 空输入不算错误:给一句引导,前端直接展示即可
-        return jsonify({
+        resp = {
             "ok": True, "text": "", "intent": "empty", "parsed": nlq.parse(""),
             "answer": "你还没输入内容。可以试试「现在加速度是多少」。",
             "data": {}, "task": None,
-        })
+        }
+        return jsonify(_with_voice(resp, channel, session_id, input_end_ms,
+                                   request_at_ms, None))
 
     group_id = str(body.get("group_id") or "").strip() or _default_group_id()
     device_id = str(body.get("device_id") or "").strip()
@@ -733,17 +874,32 @@ def nlq_query():
 
     # ---------------------------------------------------------- 动作类
     elif intent in ("sample", "pause", "resume"):
+        # 第 6 周:延迟注入(演示"慢响应")。睡眠期间用户可能点"停止",
+        # 所以睡醒后第一件事是检查会话是否已被取消 —— 取消就不下发。
+        if delay_ms:
+            time.sleep(delay_ms / 1000.0)
+        if session_id and _voice_session_cancelled(session_id):
+            answer = "这个语音任务已经被取消,没有给板子下发新命令(取消后不会补触发)。"
+            return jsonify(_with_voice({
+                "ok": True, "text": text, "intent": intent, "parsed": parsed,
+                "answer": answer, "data": {}, "task": None,
+            }, channel, session_id, input_end_ms, request_at_ms, None))
+
         if not group_id:
             answer = "还不知道要给哪个组下发(没有任何历史数据可推断),请先确认设备在上报。"
-            return jsonify({"ok": True, "text": text, "intent": intent, "parsed": parsed,
-                            "answer": answer, "data": {}, "task": None})
+            return jsonify(_with_voice({
+                "ok": True, "text": text, "intent": intent, "parsed": parsed,
+                "answer": answer, "data": {}, "task": None,
+            }, channel, session_id, input_end_ms, request_at_ms, None))
         device_id = _resolve_device_id(group_id, device_id)
         if not device_id:
             answer = f"组 {group_id} 没有历史数据,推断不出设备 ID,无法下发命令。"
-            return jsonify({"ok": True, "text": text, "intent": intent, "parsed": parsed,
-                            "answer": answer, "data": {}, "task": None})
+            return jsonify(_with_voice({
+                "ok": True, "text": text, "intent": intent, "parsed": parsed,
+                "answer": answer, "data": {}, "task": None,
+            }, channel, session_id, input_end_ms, request_at_ms, None))
 
-        task = _new_task(group_id, device_id, intent)
+        task = _new_task(group_id, device_id, intent, channel=channel)
         task_snapshot = dict(task)
         if wait:
             task_snapshot = _wait_task(task["request_id"]) or dict(task)
@@ -774,6 +930,13 @@ def nlq_query():
                 f"命令已下发,但 {NLQ_WAIT_MS} ms 内没等到板端回执(超时)。"
                 f"这通常意味着板子离线或断网 —— 我不会把它算作执行成功。"
             )
+        elif status == "cancelled":
+            # 第 6 周:用户中途取消。板端迟到的回执会被标记 late_ack 并忽略,
+            # 不会重新播放,也不会触发动作。
+            answer = (
+                "已经取消这个任务。取消之后板端即使回执,也只会被记录为"
+                "「迟到结果」并忽略 —— 不会重新播放或触发动作。"
+            )
         else:
             answer = f"命令已下发,当前状态 {status}(板端还没回执)。"
 
@@ -788,7 +951,7 @@ def nlq_query():
             "输入「你能做什么」看完整示例。"
         )
 
-    return jsonify({
+    return jsonify(_with_voice({
         "ok": True,
         "text": text,
         "intent": intent,
@@ -796,7 +959,7 @@ def nlq_query():
         "answer": answer,
         "data": data,
         "task": task_snapshot,
-    })
+    }, channel, session_id, input_end_ms, request_at_ms, task_snapshot))
 
 
 @app.post("/api/task")
@@ -816,6 +979,7 @@ def create_task():
     group_id = str(body.get("group_id", "")).strip()
     device_id = str(body.get("device_id", "")).strip()
     action = str(body.get("action", "sample")).strip() or "sample"
+    channel = str(body.get("channel", "") or "").strip()   # 第 5 周:text / voice
 
     if not group_id:
         return jsonify({"ok": False, "error": "group_id is required"}), 400
@@ -836,13 +1000,17 @@ def create_task():
         "group_id": group_id,
         "device_id": device_id,
         "action": action,
-        "status": "pending",        # pending → received → completed / failed / timeout
+        "status": "pending",        # pending → received → completed / failed / timeout / cancelled
         "created_at_ms": now,
         "dispatched_at_ms": None,   # 板端拉走命令的时间
         "received_at_ms": None,     # 板端回执"已接收"
         "completed_at_ms": None,
         "elapsed_ms": None,
         "record_index": None,       # 对应 data.json 里的记录序号
+        "cancelled": False,         # 第 6 周:用户中途取消
+        "cancelled_at_ms": None,
+        "late_ack": False,          # 第 6 周:取消之后才到的回执(迟到结果,已忽略)
+        "channel": channel,         # 第 5 周:text / voice
         "note": "",
     }
     with _task_lock:
@@ -920,6 +1088,14 @@ def ack_task():
         task = _tasks.get(request_id)
         if not task:
             return jsonify({"ok": False, "error": "unknown request_id"}), 404
+        # 第 6 周:任务已被用户取消,之后才到的回执属于"迟到结果" ——
+        # 只记录、不改状态,保证"取消后迟到结果不得重新播放或触发动作"。
+        if task.get("cancelled"):
+            task["late_ack"] = True
+            task["note"] = (task.get("note") or "") + f"[late ack:{stage} 已忽略]"
+            _persist_tasks()
+            print(f"[task] {request_id} LATE ack after cancel: {stage} (ignored)")
+            return jsonify({"ok": True, "task": dict(task), "late_ignored": True})
         if stage == "failed":
             task["status"] = "failed"
             task["completed_at_ms"] = now
@@ -1153,6 +1329,147 @@ def favicon():
     """
     from flask import Response
     return Response(status=204)
+
+
+# ============================================================
+#  第 5 周:语音识别(离线 Vosk)—— 授权录音备用路径
+#
+#  为什么需要它:浏览器实时识别(SpeechRecognition)依赖在线识别服务,
+#  麦克风故障或网络不稳时就断了。授权录音文件走「服务器离线识别」,
+#  整条"音频 → 文本"链路不依赖任何云端服务,可复现、可自动验证。
+#
+#  输入:WAV(PCM,16kHz,单声道,16bit)—— 前端用 WebAudio 重采样后编码,
+#        共享音频站录的音也按这个格式导出,格式一致才能互相对照。
+# ============================================================
+VOSK_MODEL_DIR = BASE_DIR / "models" / "vosk-model-small-cn-0.22"
+_vosk_model = None
+
+
+def _get_vosk_model():
+    """懒加载 Vosk 中文模型(首次调用约 1~2 秒,之后常驻内存)。"""
+    global _vosk_model
+    if _vosk_model is None:
+        if not VOSK_MODEL_DIR.exists():
+            raise RuntimeError(
+                f"离线识别模型未安装(期望目录:{VOSK_MODEL_DIR});"
+                "请下载 vosk-model-small-cn-0.22 并解压到 server/models/ 下")
+        from vosk import Model, SetLogLevel
+        SetLogLevel(-1)               # 关掉 Vosk 的日志噪音
+        _vosk_model = Model(str(VOSK_MODEL_DIR))
+    return _vosk_model
+
+
+@app.post("/api/voice/asr")
+def voice_asr():
+    """授权录音识别(备用路径)。multipart: audio=*.wav(16k 单声道 16bit PCM)。
+
+    返回 {ok, text, duration_ms, engine, sample_rate}。
+    识别不出内容时 text 为空串并给出可理解的 note,不猜、不编。
+    """
+    f = request.files.get("audio")
+    if not f or not f.filename:
+        return jsonify({"ok": False, "error": "缺少音频文件(字段名 audio)"}), 400
+
+    import io
+    import wave
+    raw = f.read()
+    try:
+        wf = wave.open(io.BytesIO(raw), "rb")
+    except Exception as e:
+        return jsonify({
+            "ok": False,
+            "error": f"无法解析音频:{e}。请提交 WAV(PCM 16kHz 单声道 16bit),"
+                     "浏览器端会自动重采样编码。",
+        }), 400
+
+    channels = wf.getnchannels()
+    rate = wf.getframerate()
+    width = wf.getsampwidth()
+    frames = wf.getnframes()
+    duration_ms = int(frames / rate * 1000) if rate else 0
+
+    if channels != 1 or width != 2 or rate != 16000:
+        return jsonify({
+            "ok": False,
+            "error": f"音频格式不符:{rate}Hz/{channels}声道/{width*8}bit,"
+                     "需要 16000Hz/单声道/16bit。",
+        }), 400
+
+    try:
+        from vosk import KaldiRecognizer
+        rec = KaldiRecognizer(_get_vosk_model(), 16000)
+        rec.SetWords(False)
+        text_parts = []
+        CHUNK = 4000
+        while True:
+            data = wf.readframes(CHUNK)
+            if not data:
+                break
+            if rec.AcceptWaveform(data):
+                pass
+        result = json.loads(rec.FinalResult())
+        text = (result.get("text") or "").strip()
+    except Exception as e:
+        return jsonify({"ok": False, "error": f"识别失败:{e}"}), 500
+    finally:
+        wf.close()
+
+    print(f"[voice/asr] file={f.filename} {duration_ms}ms -> '{text}'")
+    return jsonify({
+        "ok": True,
+        "text": text,
+        "duration_ms": duration_ms,
+        "engine": "vosk-small-cn-0.22(离线)",
+        "sample_rate": rate,
+        "note": "" if text else "没有识别出内容(可能录音太短或环境太吵)",
+    })
+
+
+@app.post("/api/voice/cancel")
+def voice_cancel():
+    """第 6 周:取消当前语音交互。
+
+    body: {"session_id": "...", "request_id": "..."(可选)}
+    - 标记会话取消:还没创建的任务不再下发(取消后不会补触发);
+    - 任务已创建且未终态 → 状态置 cancelled,板端迟到回执将被忽略。
+    """
+    body = request.get_json(silent=True) or {}
+    session_id = str(body.get("session_id") or "").strip()
+    request_id = str(body.get("request_id") or "").strip()
+
+    cancelled_session = _voice_session_cancel(session_id) if session_id else False
+    task_info = None
+    if request_id:
+        now = int(time.time() * 1000)
+        with _task_lock:
+            t = _tasks.get(request_id)
+            if t and t["status"] in ("pending", "received"):
+                t["cancelled"] = True
+                t["cancelled_at_ms"] = now
+                t["status"] = "cancelled"
+                task_info = dict(t)
+        if task_info:
+            _persist_tasks()
+            print(f"[voice/cancel] task {request_id} cancelled by user")
+
+    return jsonify({
+        "ok": True,
+        "session_cancelled": cancelled_session,
+        "task": task_info,
+        "note": "取消后,迟到的回执只会被记录为 late_ack,不会重新播放或触发动作。",
+    })
+
+
+@app.get("/api/voice/log")
+def voice_log():
+    """最近语音/文字交互日志(第 6 周:request_id 关联日志、时序记录)。"""
+    try:
+        limit = max(1, min(100, int(request.args.get("limit", 20))))
+    except ValueError:
+        limit = 20
+    with _voice_lock:
+        items = list(_voice_history)[-limit:][::-1]
+    return jsonify({"ok": True, "items": items, "count": len(items)})
 
 
 if __name__ == "__main__":

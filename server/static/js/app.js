@@ -868,13 +868,17 @@
       </div>`).join("");
   }
 
-  /** 问一句话。查询类秒回;动作类会真的下发任务并等板端回执(服务端上限 12s)。 */
-  async function askNlq(text) {
+  /**
+   * 问一句话。查询类秒回;动作类会真的下发任务并等板端回执(服务端上限 12s)。
+   * opts(第 5/6 周语音对照用):{channel, sessionId, inputEndMs, delayMs}
+   * 返回响应对象,供 voice.js 的「同一句走文字入口对照」使用。
+   */
+  async function askNlq(text, opts = {}) {
     const q = (text || "").trim();
     const box = $("nlqResult");
     const btn = $("nlqAskBtn");
-    if (!box) return;
-    if (!q) { toast("先输入一句话"); return; }
+    if (!box) return null;
+    if (!q) { toast("先输入一句话"); return null; }
 
     const input = $("nlqInput");
     if (input) input.value = q;
@@ -882,14 +886,18 @@
       <div class="nlq-answer loading">查询中…(若是采集/控制类指令,最多等 12 秒)</div>`;
     if (btn) btn.disabled = true;
 
-    const resp = await Api.nlqQuery(q, { groupId: state.groupId, wait: true });
+    const resp = await Api.nlqQuery(q, {
+      groupId: state.groupId, wait: true,
+      channel: opts.channel, sessionId: opts.sessionId,
+      inputEndMs: opts.inputEndMs, delayMs: opts.delayMs,
+    });
     if (btn) btn.disabled = false;
 
     if (!resp.ok) {
       box.innerHTML = `<div class="nlq-q">Q: ${esc(q)}</div>
         <div class="nlq-answer">请求失败:${esc(resp.error || "未知错误")}</div>`;
       toast("查询失败");
-      return;
+      return resp;
     }
 
     renderNlqResult(q, resp);
@@ -906,6 +914,7 @@
         toast("采集完成");
       }
     }
+    return resp;
   }
 
   // ---------- 轻量提示 ----------
@@ -932,6 +941,16 @@
     Charts.init();
     Attitude.init();
     bindEvents();
+
+    // 第 5/6 周:语音助手。暴露少量桥接接口,让 voice.js 与主应用
+    // 共用同一份 groupId、同一个文字入口函数(对照实验用)。
+    window.App = {
+      groupId: () => state.groupId,
+      askNlq: (text, opts) => askNlq(text, opts),
+      reloadTaskHistory: () => loadTaskHistory(),
+      intentText: (k) => NLQ_INTENT_TEXT[k] || k,
+    };
+    if (window.Voice) Voice.init();
 
     setSystemStatus("idle", "正在连接…");
     setBanner("info", "正在连接数据服务…");
