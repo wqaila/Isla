@@ -82,25 +82,67 @@ def _refresh_task_status(task: dict) -> dict:
     return task
 
 
+def _tail_lines(path: Path, n: int, chunk_size: int = 65536) -> list[str]:
+    """只读文件最后 n 行(从尾部倒序块读)。
+
+    data.json 是按行追加的,体积只会增长;全量解析会让重启越来越慢。
+    内存里本来就只保留最近 MAX_RECORDS 条,所以启动时读尾部就够了。
+    """
+    with path.open("rb") as f:
+        f.seek(0, os.SEEK_END)
+        end = f.tell()
+        buf = b""
+        lines: list[bytes] = []
+        while end > 0 and len(lines) <= n:
+            step = min(chunk_size, end)
+            end -= step
+            f.seek(end)
+            buf = f.read(step) + buf
+            lines = buf.split(b"\n")
+        # 最左侧一行可能被块边界截断,取末尾 n 行即可避开
+        return [l.decode("utf-8", "replace").rstrip("\r\n") for l in lines if l.strip()][-n:]
+
+
+def _rotate_if_big(path: Path, max_bytes: int, label: str) -> None:
+    """文件超过 max_bytes 时按时间戳轮转,旧文件保留(任务卡要求能手开核对)。"""
+    try:
+        if not path.exists() or path.stat().st_size < max_bytes:
+            return
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        rotated = path.with_name(f"{path.stem}.{stamp}{path.suffix}")
+        path.rename(rotated)
+        print(f"[server] {label} rotated -> {rotated.name}")
+    except Exception as e:
+        print(f"[server] rotate {label} failed: {e}")
+
+
+DATA_MAX_BYTES = 50 * 1024 * 1024      # data.json 50MB 轮转
+VOICE_LOG_MAX_BYTES = 2 * 1024 * 1024  # voice_log.jsonl 2MB 轮转
+
+
 def _load_existing():
     if not DATA_FILE.exists():
         return
     try:
-        with DATA_FILE.open("r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    _records.append(json.loads(line))
-                except json.JSONDecodeError:
-                    continue
-        print(f"[server] loaded {len(_records)} historical records from {DATA_FILE}")
+        # 只读尾部 MAX_RECORDS 行:文件长期运行后会很大,全量解析拖慢重启
+        lines = _tail_lines(DATA_FILE, MAX_RECORDS)
+        n = 0
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                _records.append(json.loads(line))
+                n += 1
+            except json.JSONDecodeError:
+                continue
+        print(f"[server] loaded {n} recent records (tail of {DATA_FILE.name})")
     except Exception as e:
         print(f"[server] load existing data failed: {e}")
 
 
 def _append_to_disk(record: dict):
+    _rotate_if_big(DATA_FILE, DATA_MAX_BYTES, "data.json")
     with DATA_FILE.open("a", encoding="utf-8") as f:
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
@@ -363,11 +405,17 @@ def _describe_all(rows: list[dict]) -> dict:
     }
 
 
+_stats_cache: dict = {"key": None, "result": None}
+
+
 @app.get("/api/stats")
 def stats():
     """对选定时间范围内的数据做统计。
 
     返回 X/Y/Z 与合加速度的 max/min/avg/std/peak_to_peak,以及采样质量指标。
+
+    缓存:key = (分组, 起始时间, 记录数, 最新一条时间戳) —— 数据没变就直接复用,
+    前端每 500ms 轮询也不会反复全量重算(5000 条时一次约 10ms)。
     """
     group_id = request.args.get("group_id", "").strip()
     since_ms = request.args.get("since_ms", "").strip()
@@ -378,10 +426,19 @@ def stats():
         except ValueError:
             since = None
 
+    with _lock:
+        count = len(_records)
+        last_ts = _records[-1].get("received_at_ms") if _records else None
+    key = (group_id, since, count, last_ts)
+    if _stats_cache["key"] == key and _stats_cache["result"] is not None:
+        return jsonify(_stats_cache["result"])
+
     rows = _filter_rows(group_id, since)
     result = _describe_all(rows)
     result["group_id"] = group_id or None
     result["since_ms"] = since
+    _stats_cache["key"] = key
+    _stats_cache["result"] = result
     return jsonify(result)
 
 
@@ -708,6 +765,7 @@ def _log_voice_session(resp: dict, task) -> None:
         }
         with _voice_lock:
             _voice_history.append(entry)
+            _rotate_if_big(VOICE_LOG_FILE, VOICE_LOG_MAX_BYTES, "voice_log.jsonl")
             with VOICE_LOG_FILE.open("a", encoding="utf-8") as f:
                 f.write(json.dumps(entry, ensure_ascii=False) + "\n")
     except Exception as e:
