@@ -17,6 +17,8 @@
     lastRecord: null,
     lastRecords: [],        // 最近一次 history 结果
     historyRangeMs: CONFIG.defaultHistoryRange,
+    lastHistoryMs: 0,       // 上次拉取历史的时间(节流拉取用)
+    lastHistoryDrawMs: 0,   // 上次重绘历史图的时间(节流重绘用)
     serverOk: false,
     serverCount: 0,
     apiFailStreak: 0,
@@ -368,11 +370,20 @@
     const now = nowMs();
     const sinceMs = state.historyRangeMs > 0 ? now - state.historyRangeMs : 0;
 
+    // 历史图是"分析视图",按 historyRefreshMs(1s)节流拉取和重绘:
+    // 实时曲线跟最新值走(200ms);历史如果也 200ms 全量重绘,
+    // x 轴平移动画(1s)永远走不完,曲线看起来一直在滑动 —— 这就是"整体抖动"的根源。
+    const needHistory = force || !state.lastHistoryMs ||
+      (now - state.lastHistoryMs >= (CONFIG.chart.historyRefreshMs || 1000));
+    if (needHistory) state.lastHistoryMs = now;
+
     // 并发请求:最新 + 历史 + 统计
     const [latestResp, historyResp, statsResp] = await Promise.all([
       Api.latest(g),
       // 历史点数跟随图表配置(默认 800),数据变密后窗口不至于被 limit 截断
-      Api.history(g, { sinceMs, limit: CONFIG.chart.historyMaxPoints }),
+      needHistory
+        ? Api.history(g, { sinceMs, limit: CONFIG.chart.historyMaxPoints })
+        : Promise.resolve(null),
       Api.stats(g, { sinceMs }),
     ]);
 
@@ -438,7 +449,8 @@
     // ---- 历史图:按 historyRefreshMs 节流(默认 1s)----
     // 实时曲线跟数据走,历史是分析视图,刷新太勤整条线会一直平移、看着发跳。
     // 切换时间范围时 force=true,立即重画。
-    if (historyResp.ok && historyResp.records) {
+    // 注意:historyResp 可能为 null(本次刷新没到拉取周期),必须先判空。
+    if (historyResp && historyResp.ok && historyResp.records) {
       state.lastRecords = historyResp.records;
       const due = force ||
         !state.lastHistoryDrawMs ||

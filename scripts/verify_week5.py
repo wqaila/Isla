@@ -141,9 +141,12 @@ def main():
             check("W5-3a 板子在线:任务完成", True, f"elapsed={task.get('elapsed_ms')} ms")
             check("W5-3b 答案报告成功且带数值", "已采集成功" in (r.get("answer") or ""),
                   (r.get("answer") or "")[:46])
-        elif st == "timeout":
-            check("W5-3a 板子离线:如实超时(不谎报成功)", "没等到" in (r.get("answer") or ""),
-                  (r.get("answer") or "")[:46])
+        elif st in ("timeout", "pending"):
+            # 板子离线:12s 等待窗口内可能还没到 15s 的任务超时,状态停在 pending。
+            # 两种状态都必须"如实说没等到",绝不出现成功字样。
+            ans = r.get("answer") or ""
+            check("W5-3a 板子离线:如实说没等到(不谎报成功)",
+                  "没等到" in ans and "已采集成功" not in ans, f"status={st} | {ans[:40]}")
         else:
             check("W5-3a 动作类终态", False, f"status={st}")
     except Exception as e:

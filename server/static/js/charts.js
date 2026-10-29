@@ -118,10 +118,12 @@ const Charts = (() => {
         font: { size: 10 },
         callback: (v) => fmtTime(v),
       };
-      // x 轴动画跟随历史刷新间隔,让平移连续而不是瞬移
+      // x 轴动画跟随历史刷新间隔,让平移连续而不是瞬移;
+      // y 不做动画 —— 历史数据已尘埃落定,每次刷新都把旧值动画到新值,
+      // 会表现为曲线反复上下漂(抖动感)
       histOpts.animations = {
-        y: { duration: Math.max(60, CONFIG.chart.animationMs), easing: "easeOutQuad" },
-        x: { duration: CONFIG.chart.historyRefreshMs || 1000, easing: "linear" },
+        y: { duration: 0 },
+        x: { duration: CONFIG.chart.historyRefreshMs || 500, easing: "linear" },
       };
       chartHistory = new Chart(c3, {
         type: "line",
@@ -230,6 +232,33 @@ const Charts = (() => {
     markDirty();
   }
 
+  /**
+   * Y 轴量程稳定化(历史图专用)。
+   * autoscale 下,每次刷新只要数据范围微变(一个离群点滑出窗口),
+   * 量程就跟着变,整条线看着上下跳。这里把范围量化到固定步长的网格,
+   * 只有"跨格"才调整量程 —— 量程稳定,曲线只反映数据本身的变化。
+   */
+  function applyStableYRange(pts) {
+    let lo = Infinity, hi = -Infinity;
+    for (const p of pts) {
+      for (const v of [p.x, p.y, p.z]) {
+        if (v === null || v === undefined) continue;
+        if (v < lo) lo = v;
+        if (v > hi) hi = v;
+      }
+    }
+    if (!isFinite(lo) || !isFinite(hi)) return;
+    const STEP = 5;   // m/s² 网格
+    let qMin = Math.floor(lo / STEP) * STEP;
+    let qMax = Math.ceil(hi / STEP) * STEP;
+    if (qMax - qMin < STEP) { qMin -= STEP; qMax += STEP; }   // 防呆:量程不能为零
+    const sc = chartHistory.options.scales.y;
+    if (sc.min !== qMin || sc.max !== qMax) {
+      sc.min = qMin;
+      sc.max = qMax;
+    }
+  }
+
   /** 渲染历史数据图(传 records 数组) */
   function renderHistory(records) {
     if (!chartHistory || !records || !records.length) {
@@ -250,23 +279,40 @@ const Charts = (() => {
     // 桶宽取 200ms 的整数倍,保证网格稳定
     const bucketMs = Math.max(200, Math.ceil(span / MAXP / 200) * 200);
 
-    const buckets = new Map();   // bucketKey -> { t, x, y, z, n }
+    const buckets = new Map();   // bucketKey -> { t, x, y, z, nx, ny, nz }
     for (const r of records) {
       const k = Math.floor(r.received_at_ms / bucketMs);
       let b = buckets.get(k);
       if (!b) {
-        b = { t: k * bucketMs, x: 0, y: 0, z: 0, n: 0 };
+        b = { t: k * bucketMs, x: 0, y: 0, z: 0, nx: 0, ny: 0, nz: 0 };
         buckets.set(k, b);
       }
       const d = r.data || {};
-      b.x += Utils.toNum(d.acc_x);
-      b.y += Utils.toNum(d.acc_y);
-      b.z += Utils.toNum(d.acc_z);
-      b.n++;
+      // 逐轴只累计有效值:缺字段/坏值不能当 0 参与平均
+      // (曾经有一条测试记录三轴为 null,把桶均值拉向 0,曲线上形成一个假凹坑)
+      const vx = Utils.toNum(d.acc_x);
+      const vy = Utils.toNum(d.acc_y);
+      const vz = Utils.toNum(d.acc_z);
+      if (vx !== null) { b.x += vx; b.nx++; }
+      if (vy !== null) { b.y += vy; b.ny++; }
+      if (vz !== null) { b.z += vz; b.nz++; }
     }
-    const pts = [...buckets.values()].sort((a, b) => a.t - b.t).map((b) => ({
-      t: b.t, x: b.x / b.n, y: b.y / b.n, z: b.z / b.n,
-    }));
+    let keys = [...buckets.keys()].sort((a, b) => a - b);
+    // 丢掉最后一个"未满"的桶:它还在随新数据累计,均值会反复变化,
+    // 表现为曲线右端不停抖动。代价是右端最多滞后一个桶宽(默认 600ms,无感)。
+    if (keys.length > 2) keys.pop();
+    const pts = keys.map((k) => {
+      const b = buckets.get(k);
+      return {
+        t: b.t,
+        x: b.nx ? b.x / b.nx : null,
+        y: b.ny ? b.y / b.ny : null,
+        z: b.nz ? b.z / b.nz : null,
+      };
+    });
+    // Y 轴量程稳定化:把数据范围量化到固定步长的网格,只有"跨格"时才改量程。
+    // 否则每次刷新只要有一个离群点,autoscale 微调量程,整条线就看着上下跳。
+    applyStableYRange(pts);
 
     const defs = [
       ["x", "X", colors.x],

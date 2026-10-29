@@ -996,7 +996,12 @@ def nlq_query():
                 "「迟到结果」并忽略 —— 不会重新播放或触发动作。"
             )
         else:
-            answer = f"命令已下发,当前状态 {status}(板端还没回执)。"
+            # 等到 NLQ_WAIT_MS 仍没终态(任务 15s 才判超时,这里先到 12s):
+            # 不把"已下发"说成成功,而是明确告知"没等到回执",并给出最可能的原因。
+            answer = (
+                f"命令已下发,但 {NLQ_WAIT_MS} ms 内没等到板端回执(当前状态 {status})。"
+                f"这通常意味着板子离线或断网 —— 我不会把它算作执行成功。"
+            )
 
     elif intent == "help":
         answer = nlq.HELP_TEXT

@@ -60,6 +60,19 @@ def get(path, timeout=TIMEOUT):
         return json.loads(r.read().decode("utf-8"))
 
 
+def _find_line(filename: str, needle: str) -> str:
+    """在数据文件里找包含 needle 的那一行(找不到返回空串)。"""
+    p = Path(__file__).resolve().parent.parent / "server" / filename
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            for line in f:
+                if needle in line:
+                    return line.strip()
+    except OSError:
+        pass
+    return ""
+
+
 def main():
     print("=" * 62)
     print("  第 6 周当堂验证 —— 澄清、取消与迟到结果隔离(自动部分)")
@@ -95,21 +108,32 @@ def main():
     except Exception as e:
         check("W6-2 迟到回执", False, f"异常:{e}")
 
-    # ---------- W6-3 迟到数据隔离 ----------
+    # ---------- W6-3 迟到数据隔离(用全新任务,避免吃到 W6-2 的状态) ----------
     print("\n=== W6-3 迟到数据不回退状态(真实采样仍留存)===")
     try:
+        # 全新任务:取消 → 板端迟到的数据(带 request_id)才到
+        t3 = post("/api/task", {"group_id": "G03", "action": "sample"})["task"]
+        rid3 = t3["request_id"]
+        post("/api/voice/cancel", {"session_id": "vs-w6-3", "request_id": rid3})
+        t3 = get(f"/api/task/{rid3}")["task"]
+        check("W6-3a 取消成功", t3["status"] == "cancelled" and t3.get("late_ack") is False,
+              f"status={t3['status']} late_ack={t3.get('late_ack')}")
+
         now = int(time.time() * 1000)
+        # ⚠️ 载荷必须和板端一致:acc_*/request_id 平铺在顶层。
+        # 服务端把除 group_id/device_id/ts_ms/status 外的顶层字段收进 record["data"],
+        # 嵌在 "data" 里会导致 request_id 读不到、三轴读不到(曲线出假凹坑)。
         post("/api/data", {"group_id": "G03", "device_id": "esp32s3-eye-01",
                            "ts_ms": now, "status": "ok",
-                           "data": {"acc_x": 1.0, "acc_y": 2.0, "acc_z": 3.0,
-                                    "request_id": rid1}})
-        t = get(f"/api/task/{rid1}")["task"]
-        check("W6-3a 状态仍 cancelled", t["status"] == "cancelled", t["status"])
-        check("W6-3b late_ack 记录(迟到数据)", t.get("late_ack") is True)
-        data_file = Path(__file__).resolve().parent.parent / "server" / "data.json"
-        with open(data_file, "r", encoding="utf-8") as f:
-            kept = any(rid1 in line for line in f)
-        check("W6-3c 数据本身已留存(不丢真实采样)", kept)
+                           "acc_x": 1.0, "acc_y": 2.0, "acc_z": 3.0,
+                           "request_id": rid3})
+        t3 = get(f"/api/task/{rid3}")["task"]
+        check("W6-3b 状态仍 cancelled(迟到数据不回退)", t3["status"] == "cancelled", t3["status"])
+        check("W6-3c late_ack 被本条迟到数据触发", t3.get("late_ack") is True)
+        # 迟到数据本身要被当成正常记录留存(字段形状正确,图表可读)
+        line = _find_line("data.json", rid3)
+        check("W6-3d 数据本身已留存(不丢真实采样)", bool(line))
+        check("W6-3e 迟到数据字段平铺(图表不会出假凹坑)", '"acc_x": 1.0' in line)
     except Exception as e:
         check("W6-3 迟到数据", False, f"异常:{e}")
 
